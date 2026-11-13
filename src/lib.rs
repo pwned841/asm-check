@@ -12,6 +12,8 @@ pub mod abi;
 pub mod ast;
 pub mod dataflow;
 pub mod diagnostic;
+pub mod docs;
+pub mod ide;
 pub mod insn;
 pub mod lints;
 pub mod lsp;

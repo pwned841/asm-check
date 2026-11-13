@@ -92,9 +92,16 @@ fn parse_statement(number: usize, code: &str, start: usize, parent: &str) -> Opt
     let rest = &code[rest_start..end];
 
     let kind = if is_data_directive(&head) {
-        StmtKind::Data { symbols: symbols_in(rest, parent) }
+        StmtKind::Data {
+            size: data_size(&head, rest),
+            directive: head,
+            symbols: symbols_in(rest, parent),
+        }
     } else if head == "equ" {
-        StmtKind::Equ { symbols: symbols_in(rest, parent) }
+        let here = tokenize(rest)
+            .iter()
+            .any(|token| matches!(token, Tok::Ident(name) if name.bytes().all(|b| b == b'$')));
+        StmtKind::Equ { symbols: symbols_in(rest, parent), here }
     } else if head == "times" {
         parse_times(number, code, rest_start, end, parent)
     } else if is_directive(&head) {
@@ -112,14 +119,59 @@ fn parse_times(number: usize, code: &str, start: usize, end: usize, parent: &str
     for (word_start, word_end) in words(code, start, end).into_iter().skip(1) {
         let word = code[word_start..word_end].to_ascii_lowercase();
         if is_data_directive(&word) {
-            break;
+            let count = evaluate(&tokenize(&code[start..word_start]));
+            let each = data_size(&word, &code[word_end..end]);
+            let size = count
+                .and_then(|count| u64::try_from(count).ok())
+                .zip(each)
+                .and_then(|(count, each)| count.checked_mul(each));
+            let symbols = symbols_in(&code[start..end], parent);
+            return StmtKind::Data { directive: word, symbols, size };
         }
         if is_known_mnemonic(&word) || is_prefix(&word) {
             let prefix = Some("times".to_string());
             return parse_instruction(number, code, word_start, end, prefix, parent);
         }
     }
-    StmtKind::Data { symbols: symbols_in(&code[start..end], parent) }
+    StmtKind::Data {
+        directive: "times".to_string(),
+        symbols: symbols_in(&code[start..end], parent),
+        size: None,
+    }
+}
+
+/// Bytes occupied by a data directive, when its operands determine it.
+fn data_size(directive: &str, operands: &str) -> Option<u64> {
+    let unit: u64 = match directive {
+        "db" | "resb" => 1,
+        "dw" | "resw" => 2,
+        "dd" | "resd" => 4,
+        "dq" | "resq" => 8,
+        "dt" | "rest" => 10,
+        "do" | "reso" => 16,
+        "dy" | "resy" => 32,
+        "dz" | "resz" => 64,
+        _ => return None,
+    };
+    if directive.starts_with("res") {
+        let count = evaluate(&tokenize(operands))?;
+        return u64::try_from(count).ok()?.checked_mul(unit);
+    }
+    let mut total = 0u64;
+    for (start, end) in split_operands(operands, 0, operands.len()) {
+        let tokens = tokenize(&operands[start..end]);
+        let repeats =
+            |token: &Tok| matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("dup"));
+        if tokens.iter().any(repeats) {
+            return None;
+        }
+        total += match tokens.as_slice() {
+            // A string is padded to a multiple of the unit.
+            [Tok::Str(bytes)] => (bytes.len() as u64).div_ceil(unit) * unit,
+            _ => unit,
+        };
+    }
+    Some(total)
 }
 
 fn parse_instruction(
@@ -196,7 +248,35 @@ fn parse_operand(text: &str, span: Span, parent: &str) -> Operand {
     collect_names(rest, parent, &mut regs, &mut symbols);
 
     let kind = if rest.contains(&Tok::Punct('[')) {
-        OperandKind::Mem(Mem { regs, symbols })
+        let mut scales = Vec::new();
+        for window in rest.windows(3) {
+            let (reg, factor) = match window {
+                [Tok::Ident(name), Tok::Punct('*'), Tok::Num(Some(factor))]
+                | [Tok::Num(Some(factor)), Tok::Punct('*'), Tok::Ident(name)] => {
+                    (Reg::parse(name), *factor)
+                }
+                _ => continue,
+            };
+            scales.extend(reg.map(|reg| (reg, factor)));
+        }
+        let relative = rest.iter().any(|token| {
+            matches!(token, Tok::Ident(word)
+                if word.eq_ignore_ascii_case("rel") || word.eq_ignore_ascii_case("rip"))
+        });
+        // What is inside the brackets, keywords aside.
+        let inner: Vec<&Tok> = rest
+            .iter()
+            .take_while(
+                |token| !matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("wrt")),
+            )
+            .filter(|token| match token {
+                Tok::Punct('[' | ']') => false,
+                Tok::Ident(word) => !is_operand_keyword(&word.to_ascii_lowercase()),
+                _ => true,
+            })
+            .collect();
+        let direct = matches!(inner.as_slice(), [Tok::Ident(_)]) && symbols.len() == 1;
+        OperandKind::Mem(Mem { regs, symbols, scales, direct, relative })
     } else if let [Tok::Ident(name)] = rest
         && let Some(reg) = Reg::parse(name)
     {
@@ -558,11 +638,43 @@ mod tests {
         assert_eq!(ins.operands[0].size, Some(32));
         assert_eq!(mem.regs, vec![Reg::new(RegId::R15, Width::W64)]);
         assert_eq!(mem.symbols, vec!["buffer".to_string()]);
+        assert_eq!(mem.scales, vec![(Reg::new(RegId::R15, Width::W64), 4)]);
+        assert!(!mem.direct && !mem.relative);
         assert_eq!(ins.operands[1].constant(), Some(0x3733_3331));
 
         let ins = instruction("mov rax, qword ptr [rel msg wrt ..got]");
         assert_eq!(ins.operands[1].symbols(), ["msg".to_string()]);
         assert_eq!(ins.operands[1].size, Some(64));
+        let OperandKind::Mem(mem) = &ins.operands[1].kind else { panic!("expected memory") };
+        assert!(mem.direct && mem.relative);
+    }
+
+    #[test]
+    fn data_sizes() {
+        let size = |source: &str| match line(source).stmt.unwrap().kind {
+            StmtKind::Data { size, .. } => size,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(size("flag db 0"), Some(1));
+        assert_eq!(size("msg db 'hello', 10, 0"), Some(7));
+        assert_eq!(size("pair dq 1, 2"), Some(16));
+        assert_eq!(size("wide dw 'abc'"), Some(4));
+        assert_eq!(size("value dd 1.5"), Some(4));
+        assert_eq!(size("buffer resb 64"), Some(64));
+        assert_eq!(size("table resq 4 * 2"), Some(64));
+        assert_eq!(size("zeros times 16 db 0"), Some(16));
+        assert_eq!(size("pad times 510-($-$$) db 0"), None);
+        assert_eq!(size("blob incbin 'file.bin'"), None);
+    }
+
+    #[test]
+    fn equ_with_current_position() {
+        let here = |source: &str| match line(source).stmt.unwrap().kind {
+            StmtKind::Equ { here, .. } => here,
+            other => panic!("expected equ, got {other:?}"),
+        };
+        assert!(here("len equ $ - msg"));
+        assert!(!here("SIZE equ 8 * 4"));
     }
 
     #[test]

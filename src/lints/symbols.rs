@@ -45,7 +45,7 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     }
     let defined = |name: &str| {
         program.symbols.contains_key(name)
-            || program.externs.contains(name)
+            || program.externs.contains_key(name)
             || name.starts_with("__")
             || name.starts_with("..")
             || name.starts_with('$')
@@ -83,7 +83,7 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 operand.span,
                 format!("undefined symbol `{name}`"),
             );
-            diagnostic = match closest(name, program.symbols.keys().chain(&program.externs)) {
+            diagnostic = match closest(name, program.symbols.keys().chain(program.externs.keys())) {
                 Some(similar) => diagnostic.help(format!("did you mean `{similar}`?")),
                 None => diagnostic.help(format!(
                     "define the label, or declare `extern {name}` if it lives in another file"

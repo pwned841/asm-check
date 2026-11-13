@@ -4,8 +4,10 @@ pub mod control;
 pub mod definedness;
 pub mod division;
 pub mod flags;
+pub mod memory;
 pub mod operands;
 pub mod registers;
+pub mod sections;
 pub mod stack;
 pub mod style;
 pub mod symbols;
@@ -51,6 +53,9 @@ pub static ALL: &[&Lint] = &[
     &operands::OPERAND_SIZE_MISMATCH,
     &operands::AMBIGUOUS_OPERAND_SIZE,
     &operands::INVALID_OPERANDS,
+    &memory::INVALID_ADDRESS,
+    &memory::IMMEDIATE_OUT_OF_RANGE,
+    &sections::JUMP_TO_DATA,
     &symbols::UNDEFINED_SYMBOL,
     &symbols::DUPLICATE_LABEL,
     &stack::UNBALANCED_STACK,
@@ -68,12 +73,21 @@ pub static ALL: &[&Lint] = &[
     &syscall::UNKNOWN_SYSCALL,
     &syscall::EXIT_CODE_TRUNCATED,
     &syscall::POINTER_FROM_CONTENTS,
+    &memory::TRUNCATED_ADDRESS,
+    &memory::DATA_SIZE_MISMATCH,
+    &memory::WRITE_TO_READONLY,
+    &memory::SHIFT_OUT_OF_RANGE,
+    &sections::CODE_IN_DATA_SECTION,
+    &sections::DATA_IN_BSS,
+    &sections::UNKNOWN_SECTION,
+    &sections::MISPLACED_LENGTH,
     &registers::CALLEE_SAVED_CLOBBERED,
     &registers::DEAD_STORE,
     &flags::UNDEFINED_FLAGS,
     &flags::FLAGS_CLOBBERED,
     &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
+    &sections::UNUSED_EXTERN,
     &control::REDUNDANT_JUMP,
     &style::MOV_ZERO,
     &style::CMP_ZERO,
@@ -84,6 +98,8 @@ pub static ALL: &[&Lint] = &[
 
 const PASSES: &[Pass] = &[
     operands::check,
+    memory::check,
+    sections::check,
     symbols::check,
     stack::check,
     control::check,

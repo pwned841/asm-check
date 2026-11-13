@@ -6,6 +6,7 @@
 
 global _start, exported, missing_symbol         ; undefined-symbol: `missing_symbol` is never defined
 extern printf
+extern puts                     ; unused-extern: never called
 
 section .text
 
@@ -18,8 +19,20 @@ operands:
     mov [buffer], [value]       ; invalid-operands: two memory operands
     mov value, rax              ; invalid-operands: a label is not a location
     push eax                    ; invalid-operands: no 32-bit push in 64-bit mode
-    and rax, 0xFFFFFFFF         ; invalid-operands: sign-extended 32-bit immediate
     mov rsi, mesage             ; undefined-symbol: did you mean `message`?
+    ret
+
+; ------------------------------------------------------------------ memory
+
+memory:
+    mov rax, [bx]               ; invalid-address: 16-bit register in an address
+    mov rax, [eax]              ; truncated-address: 32-bit pointer
+    mov rax, [flag]             ; data-size-mismatch: 8 bytes from a 1-byte variable
+    mov byte [greeting], 'H'    ; write-to-readonly: `greeting` is in .rodata
+    mov al, 300                 ; immediate-out-of-range: al holds 0-255
+    and rax, 0xFFFFFFFF         ; immediate-out-of-range: sign-extended, masks nothing
+    shl rax, 64                 ; shift-out-of-range: shifts by 0
+    call message                ; jump-to-data: `message` is not code
     ret
 
 ; ------------------------------------------------------------------- stack
@@ -138,12 +151,23 @@ _start:
     call style
     call duplicate
     call syscalls
+    call memory
 .done:
     ret                         ; ret-in-start: there is no return address
 
 section .data
 message db "hello", 10
 value   dq 0
+flag    db 0
+message_len equ $ - message     ; misplaced-length: also counts `value` and `flag`
+
+section .rodata
+greeting db "hi", 10
+
+section .date                   ; unknown-section: did you mean .data?
+typo    dq 0
 
 section .bss
 buffer  resb 64
+counter dq 0                    ; data-in-bss: the value is ignored
+    inc qword [counter]         ; code-in-data-section: not executable here

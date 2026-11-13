@@ -344,7 +344,9 @@ fn tokenize(text: &str) -> Vec<Tok> {
             let body = i + 1;
             let close =
                 bytes[body..].iter().position(|&b| b == c).map_or(bytes.len(), |p| body + p);
-            tokens.push(Tok::Str(bytes[body..close].to_vec()));
+            let raw = &bytes[body..close];
+            // Only backquoted strings interpret C-style escapes.
+            tokens.push(Tok::Str(if c == b'`' { unescape(raw) } else { raw.to_vec() }));
             i = close + 1;
         } else if c.is_ascii_digit() {
             let end = ident_end(text, i);
@@ -360,6 +362,47 @@ fn tokenize(text: &str) -> Vec<Tok> {
         }
     }
     tokens
+}
+
+/// Resolves the escapes of a backquoted string: `\n`, `\0`, `\x41`, ...
+fn unescape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'\\' || i + 1 == raw.len() {
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let digits = |from: usize, max: usize, radix: u32| {
+            raw[from..].iter().take(max).take_while(|b| (**b as char).is_digit(radix)).count()
+        };
+        let (byte, used) = match raw[i] {
+            b'n' => (b'\n', 1),
+            b't' => (b'\t', 1),
+            b'r' => (b'\r', 1),
+            b'a' => (7, 1),
+            b'b' => (8, 1),
+            b'v' => (11, 1),
+            b'f' => (12, 1),
+            b'e' => (27, 1),
+            b'x' | b'X' => {
+                let count = digits(i + 1, 2, 16);
+                let text = std::str::from_utf8(&raw[i + 1..i + 1 + count]).unwrap_or("");
+                (u8::from_str_radix(text, 16).unwrap_or(b'x'), 1 + count)
+            }
+            b'0'..=b'7' => {
+                let count = digits(i, 3, 8);
+                let text = std::str::from_utf8(&raw[i..i + count]).unwrap_or("");
+                (u8::from_str_radix(text, 8).unwrap_or(0), count)
+            }
+            other => (other, 1),
+        };
+        out.push(byte);
+        i += used;
+    }
+    out
 }
 
 /// Parses a NASM numeric literal: `42`, `0x2a`, `2ah`, `0b101`, `101b`, `0o17`, `17q`.
@@ -689,6 +732,9 @@ mod tests {
         assert_eq!(value("1 << 4 | 3"), Some(19));
         assert_eq!(value("'A'"), Some(65));
         assert_eq!(value("','"), Some(44));
+        assert_eq!(value("`0\\n`"), Some(0x0A30));
+        assert_eq!(value("`\\x41\\101\\\\`"), Some(0x5C_4141));
+        assert_eq!(value("'0\\n'"), Some(0x6E_5C30));
         assert_eq!(value("number + 31"), None);
         assert_eq!(value("$ - 4"), None);
         assert_eq!(value("1.5"), None);

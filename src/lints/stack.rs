@@ -172,7 +172,7 @@ fn check_call(program: &Program, index: usize, state: &State, out: &mut Vec<Diag
     let insn = &program.insns[index];
     let Flow::Call(target @ Target::Label(name)) = &insn.fx.flow else { return };
     // An undeclared name is `undefined-symbol`'s business, not a libc call.
-    let declared = program.externs.contains(name) || program.opaque;
+    let declared = program.externs.contains_key(name) || program.opaque;
     if program.callee(target) != Callee::External || !declared || program.is_noreturn(index) {
         return;
     }

@@ -17,7 +17,7 @@ check:
     jnz .a
     cmp rax, 5
     call helper
-    jg .a                   ;~
+    jg .a
 .a:
     ret
 helper:

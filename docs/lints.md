@@ -131,6 +131,71 @@ file, the tool looks at what it actually does, and only reports registers
 that end up destroyed as a side effect, not the ones it sets on purpose,
 which may be results under a custom calling convention.
 
+### uninitialized-register
+
+A register is read in `_start` before anything wrote it. No register
+except `rsp` has a specified value when a program starts. On Linux they
+are usually zero, which is exactly why the bug goes unnoticed.
+
+```nasm
+_start:
+    add rbx, 1          ; rbx was never set
+    mov eax, 1
+    mov edi, 1
+    syscall             ; write(fd, buf, count): rsi and rdx were never set
+```
+
+The check knows the arguments of the common system calls, and what each
+function of the file reads from its caller, so a missing argument is
+reported at the `syscall` or the `call` that needs it. Functions other
+than the entry point are assumed to receive their registers as parameters.
+
+### partial-register-read
+
+A whole register is read after only its low bits were written.
+
+```nasm
+mov al, [rsi]
+cmp rax, 10         ; bits 8-63 of rax are whatever was there
+```
+
+Load with `movzx eax, byte [rsi]`, or clear the register first. Writing a
+32-bit register is fine: it zeroes the upper half.
+
+### undefined-flags
+
+A conditional jump, `setcc` or `cmovcc` is reached when nothing has set
+the flags: at the start of the program, or after a call.
+
+```nasm
+mov rax, [count]
+jz .empty           ; mov does not set the flags
+```
+
+Data moves (`mov`, `lea`, `movzx`, `push`, `pop`) leave the flags alone.
+Compare explicitly with `test rax, rax` or `cmp`.
+
+### unknown-syscall
+
+`rax` holds a number that is not a Linux x86-64 system call. The usual
+cause is the 32-bit numbering (1 `exit`, 4 `write`), which only applies
+to `int 0x80`.
+
+### exit-code-truncated
+
+`exit` is called with a status outside 0-255. Only the low 8 bits reach
+the parent process: 256 becomes 0, which reads as success.
+
+### pointer-from-contents
+
+A system call argument that must be a pointer is loaded with the contents
+of a byte buffer instead of its address.
+
+```nasm
+mov rsi, [message]  ; the first 8 bytes of the text
+mov rsi, message    ; its address: what write expects
+```
+
 ### callee-saved-clobbered
 
 An exported function (`global`, or `main`) changes `rbx`, `rbp` or

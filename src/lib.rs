@@ -22,6 +22,7 @@ pub mod reg;
 pub mod render;
 pub mod span;
 pub mod suppress;
+pub mod syscalls;
 
 pub use diagnostic::{Diagnostic, Group, Lint, Severity};
 

@@ -64,6 +64,20 @@ registers:
     mov rax, rbx
     ret
 
+; ------------------------------------------------------------ system calls
+
+syscalls:
+    mov eax, 1
+    mov edi, 1
+    mov rsi, [message]          ; pointer-from-contents: the text, not its address
+    mov edx, 6
+    syscall
+    mov eax, 400
+    syscall                     ; unknown-syscall: no such number
+    mov edi, 256
+    mov eax, 60
+    syscall                     ; exit-code-truncated: the shell sees 0
+
 ; ------------------------------------------------------------------- flags
 
 flags:
@@ -110,7 +124,12 @@ duplicate:                      ; duplicate-label
 ; ------------------------------------------------------------- entry point
 
 _start:
+    add rbx, 1                  ; uninitialized-register: rbx was never set
+    mov al, [rsp]
+    cmp rax, 2                  ; partial-register-read: only al was written
     call operands
+    mov rax, [value]
+    jz .done                    ; undefined-flags: neither the call nor mov sets them
     call leaky
     call division
     call registers
@@ -118,6 +137,8 @@ _start:
     call control
     call style
     call duplicate
+    call syscalls
+.done:
     ret                         ; ret-in-start: there is no return address
 
 section .data

@@ -211,6 +211,20 @@ impl<'a> Program<'a> {
     /// when a `mov reg, imm` or a zero idiom in the same straight-line
     /// sequence makes it obvious.
     pub fn constant_before(&self, index: usize, reg: RegId) -> Option<i64> {
+        let write = &self.insns[self.last_write_before(index, reg)?];
+        if write.fx.zeroing {
+            Some(0)
+        } else if write.ins.mnemonic == "mov" && write.fx.full_writes.contains(reg) {
+            write.ins.operands.get(1)?.constant()
+        } else {
+            None
+        }
+    }
+
+    /// The instruction that last wrote `reg` before the one at `index`,
+    /// when it is in the same straight-line sequence: no label, jump, call
+    /// or unknown instruction in between.
+    pub fn last_write_before(&self, index: usize, reg: RegId) -> Option<usize> {
         let mut i = index;
         loop {
             if i == 0 || !self.insns[i].labels.is_empty() {
@@ -221,13 +235,7 @@ impl<'a> Program<'a> {
                 return None;
             }
             if prev.fx.writes.contains(reg) {
-                if prev.fx.zeroing {
-                    return Some(0);
-                }
-                if prev.ins.mnemonic == "mov" && prev.fx.full_writes.contains(reg) {
-                    return prev.ins.operands.get(1)?.constant();
-                }
-                return None;
+                return Some(i - 1);
             }
             i -= 1;
         }

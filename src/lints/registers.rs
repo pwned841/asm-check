@@ -1,21 +1,12 @@
-//! Register values lost by accident: clobbered by a call or a system call,
-//! not preserved for the caller, or overwritten before being read.
+//! Register values lost by accident: not preserved for the caller, or
+//! overwritten before being read.
 
 use super::Context;
 use crate::abi;
-use crate::ast::OperandKind;
-use crate::dataflow::{self, Analysis};
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::insn::Flow;
-use crate::program::{Callee, Function, Program};
+use crate::program::Callee;
 use crate::reg::{Reg, RegId, RegSet};
-use crate::span::Span;
-
-pub static CLOBBERED_REGISTER: Lint = Lint {
-    name: "clobbered-register",
-    group: Group::Suspicious,
-    summary: "a register read after a `syscall` or a call destroyed its value",
-};
 
 pub static CALLEE_SAVED_CLOBBERED: Lint = Lint {
     name: "callee-saved-clobbered",
@@ -30,141 +21,8 @@ pub static DEAD_STORE: Lint = Lint {
 };
 
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
-    dataflow::run(cx.program, &Clobbers, out);
     callee_saved(cx, out);
     dead_stores(cx, out);
-}
-
-// --- clobbered-register ----------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Culprit {
-    Syscall,
-    External,
-    /// A local function, by index.
-    Local(usize),
-}
-
-/// Where a register's value was destroyed. `line` is 0-based.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Clobber {
-    line: usize,
-    by: Culprit,
-}
-
-/// For each register, the clobber that holds on every path, if any.
-type Clobbered = [Option<Clobber>; 16];
-
-struct Clobbers;
-
-impl Analysis for Clobbers {
-    type State = Clobbered;
-
-    fn entry(&self, _: &Program, _: &Function) -> Clobbered {
-        [None; 16]
-    }
-
-    fn unknown(&self) -> Clobbered {
-        [None; 16]
-    }
-
-    fn join(&self, a: &Clobbered, b: &Clobbered) -> Clobbered {
-        std::array::from_fn(|i| if b[i].is_some() { a[i] } else { None })
-    }
-
-    fn transfer(
-        &self,
-        program: &Program,
-        index: usize,
-        state: &mut Clobbered,
-        mut out: Option<&mut Vec<Diagnostic>>,
-    ) {
-        let insn = &program.insns[index];
-        let fx = &insn.fx;
-
-        // Only registers named in the operands: implicit uses have their
-        // own lints (`div-without-rdx`).
-        let mut explicit: Vec<(Reg, Span)> = Vec::new();
-        for operand in &insn.ins.operands {
-            match &operand.kind {
-                OperandKind::Reg(reg) => explicit.push((*reg, operand.span)),
-                OperandKind::Mem(mem) => {
-                    explicit.extend(mem.regs.iter().map(|reg| (*reg, operand.span)));
-                }
-                _ => {}
-            }
-        }
-        for (reg, span) in explicit {
-            if !fx.reads.contains(reg.id) {
-                continue;
-            }
-            if let Some(clobber) = state[reg.id.index()].take()
-                && fx.known
-                && let Some(out) = out.as_deref_mut()
-            {
-                out.push(clobbered(program, reg, span, clobber));
-            }
-        }
-        for id in fx.writes.iter() {
-            state[id.index()] = None;
-        }
-
-        let (set, by) = match &fx.flow {
-            Flow::Syscall => (abi::SYSCALL_CLOBBERS, Culprit::Syscall),
-            Flow::Call(target) => match program.callee(target) {
-                Callee::Local(callee) => {
-                    (program.functions[callee].garbage(), Culprit::Local(callee))
-                }
-                Callee::External => {
-                    let mut set = abi::CALLER_SAVED;
-                    set.remove(RegId::RAX); // the return value
-                    (set, Culprit::External)
-                }
-            },
-            _ => return,
-        };
-        for id in set.iter() {
-            state[id.index()] = Some(Clobber { line: insn.line, by });
-        }
-    }
-}
-
-fn clobbered(program: &Program, reg: Reg, span: Span, clobber: Clobber) -> Diagnostic {
-    let name = reg.id.name64();
-    let line = clobber.line + 1;
-    let (what, note, help) = match clobber.by {
-        Culprit::Syscall => (
-            format!("the `syscall` on line {line}"),
-            "the kernel uses `rcx` and `r11` to return from `syscall`: both are destroyed"
-                .to_string(),
-            "keep the value in another register, or `push`/`pop` it around the `syscall`",
-        ),
-        Culprit::External => (
-            format!("the call on line {line}"),
-            format!("`{name}` is caller-saved: a function is free to overwrite it"),
-            "keep the value in a callee-saved register (`rbx`, `r12`-`r15`) or on the stack",
-        ),
-        Culprit::Local(callee) => {
-            let callee = &program.functions[callee];
-            let cause = if callee.makes_syscall && abi::SYSCALL_CLOBBERS.contains(reg.id) {
-                "runs `syscall`, which destroys `rcx` and `r11`"
-            } else {
-                "calls external code, which may overwrite caller-saved registers"
-            };
-            (
-                format!("the call to `{}` on line {line}", callee.name),
-                format!("`{}` {cause}", callee.name),
-                "save the register in the callee, or keep the value somewhere else",
-            )
-        }
-    };
-    Diagnostic::new(
-        &CLOBBERED_REGISTER,
-        span,
-        format!("`{name}` is read here, but {what} destroyed its value"),
-    )
-    .note(note)
-    .help(help)
 }
 
 // --- callee-saved-clobbered ------------------------------------------------

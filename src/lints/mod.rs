@@ -1,6 +1,7 @@
 //! The lints. Each submodule declares its [`Lint`]s and a `check` pass.
 
 pub mod control;
+pub mod definedness;
 pub mod division;
 pub mod flags;
 pub mod operands;
@@ -8,6 +9,7 @@ pub mod registers;
 pub mod stack;
 pub mod style;
 pub mod symbols;
+pub mod syscall;
 
 use crate::diagnostic::{Diagnostic, Lint};
 use crate::program::{Insn, Program};
@@ -60,9 +62,15 @@ pub static ALL: &[&Lint] = &[
     &symbols::ENTRY_NOT_GLOBAL,
     &division::DIV_WITHOUT_RDX,
     &division::IDIV_ZERO_EXTENDED,
-    &registers::CLOBBERED_REGISTER,
+    &definedness::UNINITIALIZED_REGISTER,
+    &definedness::CLOBBERED_REGISTER,
+    &definedness::PARTIAL_REGISTER_READ,
+    &syscall::UNKNOWN_SYSCALL,
+    &syscall::EXIT_CODE_TRUNCATED,
+    &syscall::POINTER_FROM_CONTENTS,
     &registers::CALLEE_SAVED_CLOBBERED,
     &registers::DEAD_STORE,
+    &flags::UNDEFINED_FLAGS,
     &flags::FLAGS_CLOBBERED,
     &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
@@ -80,8 +88,10 @@ const PASSES: &[Pass] = &[
     stack::check,
     control::check,
     division::check,
+    definedness::check,
     registers::check,
     flags::check,
+    syscall::check,
     style::check,
 ];
 

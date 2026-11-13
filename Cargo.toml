@@ -2,5 +2,12 @@
 name = "asm-check"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A semantic linter for x86-64 assembly (NASM / Intel syntax)"
+license = "MIT"
+repository = "https://github.com/pwned841/asm-check"
+readme = "README.md"
+keywords = ["assembly", "x86-64", "nasm", "linter", "lsp"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]

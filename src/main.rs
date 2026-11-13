@@ -45,6 +45,8 @@ struct Cli {
 enum Command {
     /// List every lint.
     Lints,
+    /// Run the language server on standard input and output.
+    Lsp,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -75,6 +77,13 @@ fn main() -> ExitCode {
             list_lints();
             ExitCode::SUCCESS
         }
+        Some(Command::Lsp) => match asm_check::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("asm-check: language server stopped: {error}");
+                ExitCode::FAILURE
+            }
+        },
         None => check(&cli),
     }
 }

@@ -6,6 +6,7 @@ pub mod flags;
 pub mod operands;
 pub mod registers;
 pub mod stack;
+pub mod style;
 pub mod symbols;
 
 use crate::diagnostic::{Diagnostic, Lint};
@@ -66,6 +67,11 @@ pub static ALL: &[&Lint] = &[
     &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
     &control::REDUNDANT_JUMP,
+    &style::MOV_ZERO,
+    &style::CMP_ZERO,
+    &style::SELF_MOVE,
+    &style::NOOP_ARITHMETIC,
+    &style::NEEDLESS_REX,
 ];
 
 const PASSES: &[Pass] = &[
@@ -76,6 +82,7 @@ const PASSES: &[Pass] = &[
     division::check,
     registers::check,
     flags::check,
+    style::check,
 ];
 
 pub fn run(context: &Context) -> Vec<Diagnostic> {

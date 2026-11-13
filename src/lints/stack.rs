@@ -3,7 +3,7 @@
 use super::Context;
 use crate::ast::Operand;
 use crate::dataflow::{self, Analysis};
-use crate::diagnostic::{Diagnostic, Group, Lint};
+use crate::diagnostic::{Diagnostic, Edit, Group, Lint};
 use crate::insn::{Flow, Target};
 use crate::program::{Callee, Function, Program};
 use crate::reg::RegId;
@@ -144,15 +144,19 @@ impl Analysis for Stack {
             && let Some(bytes) = constant.filter(|bytes| bytes % 8 != 0)
             && let Some(out) = out.as_deref_mut()
         {
-            out.push(
-                Diagnostic::new(
-                    &ODD_STACK_ADJUSTMENT,
-                    insn.span,
-                    format!("`rsp` is moved by {bytes} bytes, which is not a multiple of 8"),
-                )
-                .note("every `push`, `pop`, `call` and `ret` works on 8-byte slots")
-                .help(format!("round up to {}", (bytes + 7) / 8 * 8)),
-            );
+            let rounded = (bytes + 7) / 8 * 8;
+            let mut diagnostic = Diagnostic::new(
+                &ODD_STACK_ADJUSTMENT,
+                insn.span,
+                format!("`rsp` moved by {bytes} bytes"),
+            )
+            .label("not a multiple of 8, the size of a stack slot");
+            if let Some(operand) = operands.get(1) {
+                diagnostic = diagnostic
+                    .replace(format!("round up to {rounded}"), operand.span, rounded.to_string())
+                    .maybe_incorrect();
+            }
+            out.push(diagnostic);
         }
 
         match (mnemonic, reg(0), reg(1)) {
@@ -206,15 +210,18 @@ impl Analysis for Stack {
 }
 
 fn mismatched_pop(insn: &crate::program::Insn, pushed: RegId, popped: RegId) -> Diagnostic {
-    Diagnostic::new(
+    let diagnostic = Diagnostic::new(
         &MISMATCHED_POP,
         insn.span,
-        format!("`pop {popped}` takes the value that `push {pushed}` saved"),
+        format!("`pop {popped}` receives the saved `{pushed}`"),
     )
-    .note(format!(
-        "`{popped}` was pushed earlier and is still on the stack: the two end up swapped"
-    ))
-    .help("pop registers in the reverse order of the pushes")
+    .label("pops must mirror the pushes, last one first");
+    match insn.ins.operands.first() {
+        Some(operand) => diagnostic
+            .replace(format!("pop `{pushed}` here"), operand.span, pushed.name64())
+            .maybe_incorrect(),
+        None => diagnostic,
+    }
 }
 
 fn check_ret(program: &Program, index: usize, state: &State, out: &mut Vec<Diagnostic>) {
@@ -225,26 +232,37 @@ fn check_ret(program: &Program, index: usize, state: &State, out: &mut Vec<Diagn
         return;
     }
     let Some(depth) = state.rsp.depth.filter(|depth| *depth != 0) else { return };
-    let diagnostic = if depth > 0 {
-        Diagnostic::new(
-            &UNBALANCED_STACK,
-            insn.span,
-            format!("`ret` with {depth} bytes still on the stack"),
-        )
-        .note("`ret` pops whatever is on top of the stack and jumps to it")
-        .help(format!(
-            "pop what was pushed, or release it with `add rsp, {depth}`, on every path to `ret`"
-        ))
-    } else {
-        Diagnostic::new(
-            &UNBALANCED_STACK,
-            insn.span,
-            format!("`ret` after popping {} bytes more than were pushed", -depth),
-        )
-        .note("the return address has already been popped, so `ret` jumps somewhere else")
-        .help("check that every `pop` has a matching `push` on every path to `ret`")
+    if depth < 0 {
+        out.push(
+            Diagnostic::new(
+                &UNBALANCED_STACK,
+                insn.span,
+                format!("`ret` after popping {} bytes too many", -depth),
+            )
+            .label("the return address is already gone"),
+        );
+        return;
+    }
+    // When every slot is a pushed register, the fix is to pop them back.
+    let pops = state.pushed.as_ref().and_then(|stack| {
+        let registers: Option<Vec<String>> =
+            stack.iter().rev().map(|slot| slot.map(|id| format!("pop {id}"))).collect();
+        registers.filter(|pops| pops.len() as i64 * 8 == depth)
+    });
+    let (title, text) = match pops {
+        Some(pops) => ("pop what was pushed", pops.join("\n")),
+        None => ("release the stack space", format!("add rsp, {depth}")),
     };
-    out.push(diagnostic);
+    out.push(
+        Diagnostic::new(
+            &UNBALANCED_STACK,
+            insn.span,
+            format!("`ret` with {depth} bytes left on the stack"),
+        )
+        .label("jumps to the top of the stack, not to the caller")
+        .insert_before(title, insn.line, text)
+        .maybe_incorrect(),
+    );
 }
 
 fn check_call(program: &Program, index: usize, state: &State, out: &mut Vec<Diagnostic>) {
@@ -260,12 +278,17 @@ fn check_call(program: &Program, index: usize, state: &State, out: &mut Vec<Diag
         Diagnostic::new(
             &MISALIGNED_CALL,
             insn.span,
-            format!("the stack is not 16-byte aligned when calling `{name}`"),
+            format!("stack misaligned by {off} bytes at `call {name}`"),
         )
-        .note(format!(
-            "`rsp` is {off} bytes past a multiple of 16; library functions that use SSE \
-             instructions crash on a misaligned stack"
-        ))
-        .help("push one more register on entry, or `sub rsp, 8` before the call"),
+        .label("`rsp` must be a multiple of 16 here")
+        .note("library functions that use SSE crash on a misaligned stack")
+        .fix(
+            "realign around the call",
+            vec![
+                Edit::InsertBefore { line: insn.line, text: "sub rsp, 8".to_string() },
+                Edit::InsertAfter { line: insn.line, text: "add rsp, 8".to_string() },
+            ],
+        )
+        .maybe_incorrect(),
     );
 }

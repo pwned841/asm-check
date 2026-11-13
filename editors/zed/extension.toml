@@ -1,7 +1,7 @@
 id = "asm-check"
 name = "asm-check"
 description = "Semantic lints for x86-64 assembly (NASM / Intel syntax)."
-version = "0.2.0"
+version = "0.3.0"
 schema_version = 1
 authors = ["pwned841"]
 repository = "https://github.com/pwned841/asm-check"

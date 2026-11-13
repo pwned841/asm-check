@@ -12,6 +12,12 @@ Every lint belongs to a group, which sets its severity:
 Silence a lint on one line with `; asm-check: allow(name)`, for a whole
 file with `; asm-check: allow-file(name)`, or globally with `-A name`.
 
+Many lints come with a fix, shown as a diff and offered as a code action.
+A fix is *safe* when it cannot change what the program does: `--fix`
+applies those. The others guess at what was meant (which register to
+test, which size a store should have) and are applied only with
+`--unsafe-fixes`, or one at a time from the editor.
+
 ## Correctness
 
 ### operand-size-mismatch
@@ -323,6 +329,43 @@ characters with `printf` and returns exits with status 12.
 
 A comparison whose outcome never varies: `cmp rax, rax` is always equal,
 `test rax, 0` always gives zero.
+
+### buffer-overflow
+
+A system call is given a length larger than the buffer it points to, when
+both are known.
+
+```nasm
+buffer resb 64
+    xor eax, eax        ; read
+    mov rsi, buffer
+    mov edx, 128        ; may store 128 bytes in a 64-byte buffer
+    syscall
+```
+
+For `write`, the extra bytes sent are whatever follows the string.
+
+### missing-nul-terminator
+
+A string defined with `db` and no final zero is passed where a C string is
+expected: the path of `open`, the argument of `puts`, `printf`, `strlen`.
+The reader goes on past the end until it meets a zero byte. The fix
+appends `, 0`.
+
+### infinite-loop
+
+A loop that jumps back on a comparison of values it never changes:
+
+```nasm
+.wait:
+    add rbx, 1
+    cmp rcx, 5          ; nothing in the loop writes rcx
+    jne .wait
+```
+
+Only reported for a single straight-line loop whose test is a `cmp` or
+`test`. With a memory operand, any store in the loop counts as a possible
+update.
 
 ### callee-saved-clobbered
 

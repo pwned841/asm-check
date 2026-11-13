@@ -138,3 +138,39 @@ fn showcase_triggers_every_lint() {
         .collect();
     assert!(missing.is_empty(), "examples/showcase.s does not trigger {missing:?}");
 }
+
+/// Applying fixes must never crash, and the safe ones must never make
+/// things worse: no new error may appear.
+#[test]
+fn fixes_apply_cleanly() {
+    use asm_check::Severity;
+    let config = Config { pedantic: true, ..Config::default() };
+    let errors = |source: &str| {
+        check(source, &config).iter().filter(|d| d.severity == Severity::Error).count()
+    };
+    for path in sources("fixtures").into_iter().chain(sources("clean")) {
+        let source = fs::read_to_string(&path).unwrap();
+        for safe_only in [true, false] {
+            let mut text = source.clone();
+            for _ in 0..16 {
+                let diagnostics = check(&text, &config);
+                let fixes = diagnostics
+                    .iter()
+                    .filter_map(|d| d.fix.as_ref())
+                    .filter(|fix| fix.safe || !safe_only);
+                let (fixed, applied) = asm_check::fix::apply(&text, fixes);
+                if applied == 0 {
+                    break;
+                }
+                text = fixed;
+            }
+            if safe_only {
+                assert!(
+                    errors(&text) <= errors(&source),
+                    "{}: safe fixes introduced an error:\n{text}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

@@ -66,23 +66,27 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         if !VARIADIC.contains(&name.as_str()) || program.callee(target) != Callee::External {
             continue;
         }
-        let what = match rax_source(program, index) {
-            RaxSource::Result(previous) => format!(
-                "holds the result of the `{}` on line {}",
-                program.insns[previous].ins.mnemonic,
-                program.insns[previous].line + 1
-            ),
-            RaxSource::Entry => "has not been set in this function".to_string(),
+        let (label, origin) = match rax_source(program, index) {
+            RaxSource::Result(previous) => {
+                ("`al` still holds an earlier result", Some(program.insns[previous].span))
+            }
+            RaxSource::Entry => ("`al` was never set in this function", None),
             RaxSource::Set | RaxSource::Unknown => continue,
         };
+        let mut diagnostic = Diagnostic::new(
+            &VARIADIC_CALL_WITHOUT_AL,
+            insn.span,
+            format!("`{name}` called without setting `al`"),
+        )
+        .label(label)
+        .note("a variadic function reads `al` as the number of vector registers used");
+        if let Some(span) = origin {
+            diagnostic = diagnostic.note_at(span, "`rax` was last written here");
+        }
         out.push(
-            Diagnostic::new(
-                &VARIADIC_CALL_WITHOUT_AL,
-                insn.span,
-                format!("`{name}` is variadic and reads `al`, which {what}"),
-            )
-            .note("`al` must hold the number of vector registers used for the arguments")
-            .help("put `xor eax, eax` right before the call when no floating-point argument is passed"),
+            diagnostic
+                .insert_before("no vector arguments: clear `eax`", insn.line, "xor eax, eax")
+                .maybe_incorrect(),
         );
     }
 
@@ -94,22 +98,26 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 if insn.fx.flow != Flow::Ret {
                     continue;
                 }
-                let message = match rax_source(program, index) {
+                let (message, origin) = match rax_source(program, index) {
                     RaxSource::Result(previous) => {
                         let previous = &program.insns[previous];
-                        format!(
-                            "`main` returns the result of `{}` (line {}) as the exit status",
-                            cx.code(previous),
-                            previous.line + 1
+                        (
+                            format!("`main` returns the result of `{}`", cx.code(previous)),
+                            Some(previous.span),
                         )
                     }
-                    RaxSource::Entry => "`main` returns without setting `eax`".to_string(),
+                    RaxSource::Entry => ("`main` returns without setting `eax`".to_string(), None),
                     RaxSource::Set | RaxSource::Unknown => continue,
                 };
+                let mut diagnostic = Diagnostic::new(&MAIN_RETURN_VALUE, insn.span, message)
+                    .label("`eax` becomes the exit status");
+                if let Some(span) = origin {
+                    diagnostic = diagnostic.note_at(span, "`eax` was last set here");
+                }
                 out.push(
-                    Diagnostic::new(&MAIN_RETURN_VALUE, insn.span, message)
-                        .note("the value `main` returns in `eax` becomes the exit status of the program")
-                        .help("set it before `ret`: `xor eax, eax` for success"),
+                    diagnostic
+                        .insert_before("return 0", insn.line, "xor eax, eax")
+                        .maybe_incorrect(),
                 );
             }
         }

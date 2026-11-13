@@ -33,10 +33,17 @@ pub static UNUSED_LABEL: Lint = Lint {
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     let program = cx.program;
 
-    for (_, span, first) in &program.duplicates {
-        let message =
-            format!("label `{}` is already defined on line {}", cx.text(*span), first + 1);
-        out.push(Diagnostic::new(&DUPLICATE_LABEL, *span, message));
+    for (name, span, _) in &program.duplicates {
+        let mut diagnostic = Diagnostic::new(
+            &DUPLICATE_LABEL,
+            *span,
+            format!("`{}` is defined twice", cx.text(*span)),
+        )
+        .label("second definition");
+        if let Some(first) = program.symbols.get(name) {
+            diagnostic = diagnostic.note_at(first.span, "first defined here");
+        }
+        out.push(diagnostic);
     }
 
     // Past this point the checks need the complete symbol table, which a
@@ -57,16 +64,22 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         && !program.globals.contains_key("_start")
     {
         out.push(
-            Diagnostic::new(&ENTRY_NOT_GLOBAL, start.span, "`_start` is not declared `global`")
-                .note("the linker only sees exported symbols and will not find the entry point")
-                .help("add `global _start` at the top of the file"),
+            Diagnostic::new(&ENTRY_NOT_GLOBAL, start.span, "`_start` is not exported")
+                .label("the linker will not find the entry point")
+                .insert_before("declare it `global`", start.span.line, "global _start"),
         );
     }
 
     for (name, span) in &program.globals {
         if !defined(name) {
-            let message = format!("`{name}` is declared `global` but never defined");
-            out.push(Diagnostic::new(&UNDEFINED_SYMBOL, *span, message));
+            out.push(
+                Diagnostic::new(
+                    &UNDEFINED_SYMBOL,
+                    *span,
+                    format!("`global {name}` is never defined"),
+                )
+                .label("no such label in this file"),
+            );
         }
     }
 
@@ -86,15 +99,30 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             );
             let budget = (name.chars().count() / 3).max(1);
             let labels = program.symbols.keys().chain(program.externs.keys()).map(String::as_str);
-            let register = text::closest(name, reg::names(), 1);
-            diagnostic = match (register, text::closest(name, labels, budget)) {
-                (Some(register), _) => {
-                    diagnostic.help(format!("did you mean the register `{register}`?"))
+            let suggestion = text::closest(name, reg::names(), 1)
+                .or_else(|| text::closest(name, labels, budget));
+            // What is written in the source: a local label keeps its dot.
+            let operand_text = cx.text(operand.span);
+            let written = name.rfind('.').map(|dot| &name[dot..]).filter(|short| {
+                operand_text.contains(short) && !operand_text.contains(name.as_str())
+            });
+            let written = written.unwrap_or(name.as_str());
+            diagnostic = match suggestion {
+                Some(similar) => {
+                    // Offer the short form of a local label of the same scope.
+                    let short = match (name.rfind('.'), similar.rfind('.')) {
+                        (Some(a), Some(b)) if name[..a] == similar[..b] => &similar[b..],
+                        _ => similar,
+                    };
+                    let fixed = operand_text.replacen(written, short, 1);
+                    diagnostic
+                        .label("not defined in this file")
+                        .replace(format!("did you mean `{short}`?"), operand.span, fixed)
+                        .maybe_incorrect()
                 }
-                (None, Some(similar)) => diagnostic.help(format!("did you mean `{similar}`?")),
-                (None, None) => diagnostic.help(format!(
-                    "define the label, or declare `extern {name}` if it lives in another file"
-                )),
+                None => diagnostic
+                    .label("not defined in this file")
+                    .help(format!("define it, or declare `extern {name}`")),
             };
             out.push(diagnostic);
         }
@@ -112,9 +140,15 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         }
         let text = cx.text(symbol.span);
         let message = match symbol.kind {
-            SymbolKind::Code => format!("label `{text}` is never jumped to or called"),
-            _ => format!("`{text}` is never used"),
+            SymbolKind::Code => format!("unused label `{text}`"),
+            _ => format!("unused `{text}`"),
         };
-        out.push(Diagnostic::new(&UNUSED_LABEL, symbol.span, message));
+        let mut diagnostic = Diagnostic::new(&UNUSED_LABEL, symbol.span, message);
+        // A label alone on its line can go without touching any code.
+        if program.lines[symbol.span.line].stmt.is_none() {
+            diagnostic =
+                diagnostic.delete_line("remove the label", symbol.span.line).maybe_incorrect();
+        }
+        out.push(diagnostic);
     }
 }

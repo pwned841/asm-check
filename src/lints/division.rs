@@ -4,7 +4,7 @@
 use super::Context;
 use crate::ast::Operand;
 use crate::dataflow::{self, Analysis};
-use crate::diagnostic::{Diagnostic, Group, Lint};
+use crate::diagnostic::{Diagnostic, Edit, Group, Lint};
 use crate::insn::Flow;
 use crate::program::{Callee, Function, Program};
 use crate::reg::RegId;
@@ -40,7 +40,8 @@ enum Stale {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Rdx {
-    Zeroed,
+    /// Zeroed on this line.
+    Zeroed(usize),
     SignExtended,
     /// Written on purpose, in some other way.
     Set,
@@ -122,7 +123,7 @@ impl Analysis for Dividend {
             _ if matches!(mnemonic, "cqo" | "cdq" | "cwd") => Rdx::SignExtended,
             // `mov dl, 0` leaves the upper bits as they were.
             Some(dest) if !dest.width.is_full() => *state,
-            Some(_) if insn.fx.zeroing || zero_constant => Rdx::Zeroed,
+            Some(_) if insn.fx.zeroing || zero_constant => Rdx::Zeroed(insn.line),
             _ => Rdx::Set,
         };
     }
@@ -132,49 +133,55 @@ fn report(program: &Program, index: usize, state: Rdx, out: &mut Vec<Diagnostic>
     let insn = &program.insns[index];
     let mnemonic = insn.ins.mnemonic.as_str();
     let signed = mnemonic == "idiv";
+    let span_of = |line: usize| program.at_line(line).map(|at| program.insns[at].span);
+    let (prepare, title) = if signed {
+        ("cqo", "sign-extend `rax` into `rdx` first")
+    } else {
+        ("xor edx, edx", "clear `rdx` first")
+    };
     match state {
         Rdx::Stale(reason) => {
-            let because = match reason {
-                Stale::Entry => "is never set before this point".to_string(),
-                Stale::Call(line) => format!("was left undefined by the call on line {}", line + 1),
-                Stale::Argument(line) => format!(
-                    "still holds the third argument of the system call on line {}",
-                    line + 1
-                ),
+            let mut diagnostic = Diagnostic::new(
+                &DIV_WITHOUT_RDX,
+                insn.span,
+                format!("`rdx` is not set up for `{mnemonic}`"),
+            )
+            .label("divides `rdx:rax`");
+            let origin = match reason {
+                Stale::Entry => None,
+                Stale::Call(line) => Some((line, "`rdx` is left undefined by this call")),
                 Stale::Division(line) if line == insn.line => {
-                    "still holds the remainder of the previous iteration".to_string()
+                    diagnostic =
+                        diagnostic.note("on the next iteration `rdx` still holds this remainder");
+                    None
                 }
-                Stale::Division(line) => {
-                    format!("still holds the remainder of the division on line {}", line + 1)
-                }
+                Stale::Division(line) => Some((line, "`rdx` receives this remainder")),
+                Stale::Argument(line) => Some((line, "`rdx` was the 3rd argument of this call")),
             };
-            let fix = if signed {
-                "sign-extend `rax` into it first with `cqo` (`cdq` for a 32-bit division)"
-            } else {
-                "clear it first with `xor edx, edx`"
-            };
-            out.push(
-                Diagnostic::new(
-                    &DIV_WITHOUT_RDX,
-                    insn.span,
-                    format!("`{mnemonic}` divides `rdx:rax`, but `rdx` {because}"),
-                )
-                .note(
-                    "a leftover `rdx` gives a wrong quotient, or a divide error (SIGFPE) \
-                     when the quotient does not fit",
-                )
-                .help(fix),
-            );
+            if let Some((line, text)) = origin
+                && let Some(span) = span_of(line)
+            {
+                diagnostic = diagnostic.note_at(span, text);
+            }
+            out.push(diagnostic.insert_before(title, insn.line, prepare).maybe_incorrect());
         }
-        Rdx::Zeroed if signed => out.push(
-            Diagnostic::new(
+        Rdx::Zeroed(line) if signed => {
+            let mut diagnostic = Diagnostic::new(
                 &IDIV_ZERO_EXTENDED,
                 insn.span,
-                "`idiv` is a signed division, but `rdx` was zeroed instead of sign-extended",
+                "`idiv` with a zero-extended dividend",
             )
-            .note("with `rdx` = 0 a negative `rax` is read as a huge positive number")
-            .help("use `cqo` (`cdq` for a 32-bit division) right before `idiv`"),
-        ),
+            .label("signed division")
+            .note("a negative `rax` is read as a huge positive number");
+            let mut edits = vec![Edit::InsertBefore { line: insn.line, text: "cqo".to_string() }];
+            if let Some(span) = span_of(line) {
+                diagnostic = diagnostic.note_at(span, "`rdx` is zeroed here");
+                if program.lines[line].label.is_none() {
+                    edits.insert(0, Edit::DeleteLine(line));
+                }
+            }
+            out.push(diagnostic.fix("sign-extend with `cqo` instead", edits).maybe_incorrect());
+        }
         _ => {}
     }
 }

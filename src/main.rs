@@ -36,6 +36,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = LevelArg::Hint)]
     level: LevelArg,
 
+    /// Apply the fixes that cannot change what the program does, in place.
+    #[arg(long)]
+    fix: bool,
+
+    /// With `--fix`, also apply the fixes that guess at what was meant.
+    #[arg(long, requires = "fix")]
+    unsafe_fixes: bool,
+
     /// When to use colours.
     #[arg(long, value_enum, default_value_t = ColorArg::Auto)]
     color: ColorArg,
@@ -143,6 +151,22 @@ fn check(cli: &Cli) -> ExitCode {
             }
         };
         let name = file.display().to_string();
+        let source = if cli.fix && file != Path::new("-") {
+            let (fixed, count) = apply_fixes(&source, &config, cli.unsafe_fixes);
+            if count > 0 {
+                if let Err(error) = std::fs::write(file, &fixed) {
+                    eprintln!("asm-check: {name}: {error}");
+                    return ExitCode::from(2);
+                }
+                eprintln!(
+                    "asm-check: {name}: applied {}",
+                    plural(count, "fix").replace("fixs", "fixes")
+                );
+            }
+            fixed
+        } else {
+            source
+        };
         if asm_check::is_gnu_syntax(&source) {
             eprintln!("asm-check: {name}: skipped, GNU assembler syntax is not supported");
         }
@@ -172,6 +196,27 @@ fn check(cli: &Cli) -> ExitCode {
 
     let failing = if cli.deny_warnings { Severity::Warning } else { Severity::Error };
     if all.iter().any(|d| d.severity >= failing) { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// Applies fixes until none is left: one fix can uncover another, and two
+/// fixes that touch the same line go in separate passes.
+fn apply_fixes(source: &str, config: &Config, unsafe_fixes: bool) -> (String, usize) {
+    let mut text = source.to_string();
+    let mut total = 0;
+    for _ in 0..16 {
+        let diagnostics = asm_check::check(&text, config);
+        let fixes = diagnostics
+            .iter()
+            .filter_map(|diagnostic| diagnostic.fix.as_ref())
+            .filter(|fix| fix.safe || unsafe_fixes);
+        let (fixed, count) = asm_check::fix::apply(&text, fixes);
+        if count == 0 {
+            break;
+        }
+        total += count;
+        text = fixed;
+    }
+    (text, total)
 }
 
 fn plural(count: usize, noun: &str) -> String {

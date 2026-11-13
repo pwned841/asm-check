@@ -53,7 +53,10 @@ fn parse_line(number: usize, raw: &str, parent: &mut String) -> Line {
         let special = word.starts_with("..");
         let local = word.starts_with('.') && !special;
         let name = if local { format!("{parent}{word}") } else { word.to_string() };
-        if !local && !special {
+        // A lone word without a colon is as likely a half-typed instruction
+        // as a label: it does not open a new scope for local labels.
+        let lone = !has_colon && code[after..].trim().is_empty();
+        if !local && !special && !lone {
             *parent = word.to_string();
         }
         line.label =
@@ -408,7 +411,7 @@ fn unescape(raw: &[u8]) -> Vec<u8> {
 }
 
 /// Parses a NASM numeric literal: `42`, `0x2a`, `2ah`, `0b101`, `101b`, `0o17`, `17q`.
-fn parse_number(literal: &str) -> Option<i64> {
+pub(crate) fn parse_number(literal: &str) -> Option<i64> {
     let text = literal.replace('_', "").to_ascii_lowercase();
     let radix = |digits: &str, radix: u32| {
         u64::from_str_radix(digits, radix).ok().map(|value| value as i64)
@@ -516,7 +519,7 @@ impl Evaluator<'_> {
     }
 }
 
-fn is_ident_byte(b: u8) -> bool {
+pub(crate) fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(b, b'_' | b'.' | b'$' | b'#' | b'@' | b'~' | b'?')
         || b >= 0x80
@@ -542,7 +545,7 @@ fn skip_ws(text: &str, start: usize) -> usize {
 }
 
 /// Byte offset of the `;` that starts the comment, or the line length.
-fn comment_start(line: &str) -> usize {
+pub(crate) fn comment_start(line: &str) -> usize {
     let mut quote = None;
     for (i, b) in line.bytes().enumerate() {
         match quote {
@@ -674,6 +677,13 @@ mod tests {
         };
         assert_eq!(target(2), "main.loop");
         assert_eq!(target(4), "other.loop");
+    }
+
+    #[test]
+    fn a_lone_word_does_not_open_a_scope() {
+        let lines = parse("main:\n.loop:\n    mo\n    jmp .loop\n");
+        let StmtKind::Instruction(ins) = &lines[3].stmt.as_ref().unwrap().kind else { panic!() };
+        assert_eq!(ins.operands[0].symbols(), ["main.loop".to_string()]);
     }
 
     #[test]

@@ -185,8 +185,8 @@ source ─▶ parser ─▶ lines ─▶ program ─▶ lints ─▶ diagnostics
 1. **Parsing** ([src/parser.rs](src/parser.rs)) is line-oriented and never
    fails: what it does not recognise becomes an instruction with an unknown
    mnemonic.
-2. **Instruction effects** ([src/insn.rs](src/insn.rs)) describe, for about
-   120 mnemonics, which registers and flags are read and written and where
+2. **Instruction effects** ([src/insn.rs](src/insn.rs)) describe, for 110
+   mnemonics and every conditional form (`jcc`, `setcc`, `cmovcc`), which registers and flags are read and written and where
    control goes. Unknown instructions (SSE, AVX, macros) are marked as such
    and every analysis treats them as "could do anything".
 3. **Program structure** ([src/program.rs](src/program.rs)). Assembly has

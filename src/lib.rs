@@ -14,6 +14,7 @@ pub mod dataflow;
 pub mod diagnostic;
 pub mod insn;
 pub mod lints;
+pub mod lsp;
 pub mod mnemonic;
 pub mod parser;
 pub mod program;

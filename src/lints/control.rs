@@ -2,7 +2,7 @@
 //! from the entry point.
 
 use super::Context;
-use crate::diagnostic::{Diagnostic, Group, Lint};
+use crate::diagnostic::{Diagnostic, Edit, Group, Lint};
 use crate::insn::{Flow, Target};
 use crate::reg::RegId;
 
@@ -73,8 +73,14 @@ fn opposite(code: &str) -> Option<&'static str> {
     })
 }
 
-const EXIT_HELP: &str =
-    "end with `ret`, a `jmp`, or the exit system call (`mov eax, 60` / `syscall`)";
+/// How a function should end: the entry point exits, the others return.
+fn ending(entry_point: bool) -> (&'static str, &'static str) {
+    if entry_point {
+        ("exit the program here", "mov eax, 60\nxor edi, edi\nsyscall")
+    } else {
+        ("return here", "ret")
+    }
+}
 
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     let program = cx.program;
@@ -83,9 +89,17 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         for &(block, next) in &function.falls_into {
             let last = &program.insns[program.blocks[block].end - 1];
             let next = &program.functions[next];
-            let message =
-                format!("`{}` falls through into the function `{}`", function.name, next.name);
-            out.push(Diagnostic::new(&FALLTHROUGH, last.span, message).help(EXIT_HELP));
+            let (title, text) = ending(function.entry_point);
+            out.push(
+                Diagnostic::new(
+                    &FALLTHROUGH,
+                    last.span,
+                    format!("`{}` falls through into `{}`", function.name, next.name),
+                )
+                .label("nothing stops execution after this")
+                .fix(title, vec![Edit::InsertAfter { line: last.line, text: text.to_string() }])
+                .maybe_incorrect(),
+            );
         }
         if function.entry_point {
             for &block in &function.blocks {
@@ -96,13 +110,15 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                             Diagnostic::new(
                                 &RET_IN_START,
                                 insn.span,
-                                format!("`ret` in `{}`, which nothing called", function.name),
+                                format!("`ret` in `{}`", function.name),
                             )
-                            .note(
-                                "the top of the stack holds `argc`, not a return address: \
-                                 `ret` jumps to it and crashes",
+                            .label("there is no return address: the stack holds `argc`")
+                            .replace(
+                                "exit with the system call",
+                                insn.span,
+                                "mov eax, 60\nxor edi, edi\nsyscall",
                             )
-                            .help("leave with the exit system call: `mov eax, 60` / `syscall`"),
+                            .maybe_incorrect(),
                         );
                     }
                 }
@@ -118,18 +134,27 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             // A `syscall` whose number we cannot see may well be `exit`.
             let number = program.constant_before(last_index, RegId::RAX);
             if last.fx.flow != Flow::Syscall || number.is_some() {
+                let entry = program.functions_of(index).any(|function| function.entry_point);
+                let (title, text) = ending(entry);
                 let mut diagnostic = Diagnostic::new(
                     &FALLTHROUGH,
                     last.span,
-                    "execution runs past the last instruction",
+                    "execution runs past the end of the code",
                 )
-                .note("the processor goes on to execute whatever bytes come next in memory")
-                .help(EXIT_HELP);
+                .label("the processor goes on with whatever bytes follow");
                 if let (Flow::Syscall, Some(number)) = (&last.fx.flow, number) {
+                    let name = crate::syscalls::lookup(number).map_or("it", |syscall| syscall.name);
                     diagnostic = diagnostic
-                        .note(format!("system call {number} is not `exit`: it returns here"));
+                        .note(format!("system call {number} is not `exit`: {name} returns"));
                 }
-                out.push(diagnostic);
+                out.push(
+                    diagnostic
+                        .fix(
+                            title,
+                            vec![Edit::InsertAfter { line: last.line, text: text.to_string() }],
+                        )
+                        .maybe_incorrect(),
+                );
             }
         }
 
@@ -143,15 +168,8 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             if before.run == first.run && !chained {
                 out.push(
                     Diagnostic::new(&UNREACHABLE_CODE, first.span, "unreachable code")
-                        .note_at(
-                            before.span,
-                            format!(
-                                "control never gets past `{}` on line {}, and no label leads here",
-                                cx.code(before),
-                                before.line + 1
-                            ),
-                        )
-                        .help("remove it, or add the label that was meant to jump here"),
+                        .label("never executed")
+                        .note_at(before.span, "control does not continue past this"),
                 );
             }
         }
@@ -159,6 +177,7 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
 
     for (index, insn) in program.insns.iter().enumerate() {
         let target_of = |name: &String| program.symbols.get(name).and_then(|symbol| symbol.insn);
+        let deletable = |line: usize| program.lines[line].label.is_none();
 
         // jcc .skip / jmp target / .skip:
         if let Flow::CondJump(Target::Label(skip)) = &insn.fx.flow
@@ -173,13 +192,19 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             let mut diagnostic = Diagnostic::new(
                 &JUMP_OVER_JUMP,
                 insn.span,
-                format!("`{}` only skips the `jmp` that follows it", cx.code(insn)),
+                format!("`{}` only skips a `jmp`", insn.ins.mnemonic),
             );
-            if let Some(opposite) = opposite(code) {
-                diagnostic = diagnostic.help(format!(
-                    "use `j{opposite} {}` and remove the `jmp`",
-                    cx.text(operand.span)
-                ));
+            if let Some(opposite) = opposite(code)
+                && deletable(next.line)
+            {
+                let direct = format!("j{opposite} {}", cx.text(operand.span));
+                diagnostic = diagnostic.fix(
+                    format!("use `{direct}`"),
+                    vec![
+                        Edit::Replace { span: insn.span, text: direct },
+                        Edit::DeleteLine(next.line),
+                    ],
+                );
             }
             out.push(diagnostic);
         }
@@ -193,45 +218,39 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             && let (Some(from), Some(to)) =
                 (insn.ins.operands.first(), program.insns[landing].ins.operands.first())
         {
-            let (from, to) = (cx.text(from.span), cx.text(to.span));
-            out.push(
-                Diagnostic::new(
-                    &JUMP_TO_JUMP,
-                    insn.span,
-                    format!("`{from}` only jumps on to `{to}`"),
-                )
-                .help(format!("jump to `{to}` directly")),
-            );
+            let (from_text, to_text) = (cx.text(from.span), cx.text(to.span));
+            let mut diagnostic = Diagnostic::new(
+                &JUMP_TO_JUMP,
+                from.span,
+                format!("`{from_text}` only jumps on to `{to_text}`"),
+            )
+            .note_at(program.insns[landing].span, "the jump lands here");
+            // A local label means the same thing only inside its own scope.
+            let scope = |name: &str| name.split('.').next().unwrap_or("").to_string();
+            if !to_text.starts_with('.') || scope(name) == scope(onward) {
+                diagnostic =
+                    diagnostic.replace(format!("jump to `{to_text}` directly"), from.span, to_text);
+            }
+            out.push(diagnostic);
         }
 
         match &insn.fx.flow {
             Flow::Int(Some(0x80)) => out.push(
-                Diagnostic::new(
-                    &INT80_IN_64BIT,
-                    insn.span,
-                    "`int 0x80` is the 32-bit system call interface",
-                )
-                .note(
-                    "in a 64-bit program it truncates pointers to 32 bits and uses the \
-                     32-bit call numbers",
-                )
-                .help(
-                    "use `syscall`: number in `rax`, arguments in `rdi`, `rsi`, `rdx`, `r10`, \
-                     `r8`, `r9`",
-                ),
+                Diagnostic::new(&INT80_IN_64BIT, insn.span, "`int 0x80` in 64-bit code")
+                    .label("the 32-bit system call interface")
+                    .note("it truncates pointers to 32 bits and uses different call numbers")
+                    .help("use `syscall`, with the number in `rax` and arguments in `rdi`, `rsi`, `rdx`"),
             ),
             Flow::Jump(Target::Label(name)) => {
-                let target = program.symbols.get(name).and_then(|symbol| symbol.insn);
                 let next_in_run =
                     program.insns.get(index + 1).is_some_and(|next| next.run == insn.run);
-                if target == Some(index + 1) && next_in_run {
+                if target_of(name) == Some(index + 1) && next_in_run {
                     let mut diagnostic = Diagnostic::new(
                         &REDUNDANT_JUMP,
                         insn.span,
-                        "this `jmp` goes to the very next instruction",
-                    )
-                    .help("remove it: execution continues there anyway");
-                    if program.lines[insn.line].label.is_none() {
+                        "`jmp` to the next instruction",
+                    );
+                    if deletable(insn.line) {
                         diagnostic = diagnostic.delete_line("remove the jump", insn.line);
                     }
                     out.push(diagnostic);

@@ -117,15 +117,16 @@ fn address(cx: &Context, insn: &Insn, operand: &Operand, mem: &Mem, out: &mut Ve
     }
 
     if insn.ins.mnemonic != "lea" && !mem.regs.is_empty() && widths(Width::W32) == mem.regs.len() {
-        let first = mem.regs[0];
+        // Rewrite every 32-bit register of the operand as its 64-bit form.
+        let mut wide = text.to_string();
+        for reg in &mem.regs {
+            wide = wide.replace(reg.name(), reg.id.name64());
+        }
         out.push(
-            Diagnostic::new(
-                &TRUNCATED_ADDRESS,
-                operand.span,
-                format!("`{text}` addresses memory with a 32-bit register"),
-            )
-            .note("the upper half of the pointer is dropped, which breaks above 4 GiB")
-            .help(format!("use `{}`", first.id.name64())),
+            Diagnostic::new(&TRUNCATED_ADDRESS, operand.span, format!("32-bit address `{text}`"))
+                .label("the upper half of the pointer is dropped")
+                .replace(format!("use `{wide}`"), operand.span, wide)
+                .maybe_incorrect(),
         );
     }
 }
@@ -179,10 +180,11 @@ fn access(
             Diagnostic::new(
                 &WRITE_TO_READONLY,
                 operand.span,
-                format!("`{name}` is in `{}`, which is read-only", symbol.section),
+                format!("write to read-only `{name}`"),
             )
-            .note("the store faults at run time (segmentation fault)")
-            .help(format!("define `{name}` in `.data`, or in `.bss` if it needs no initial value")),
+            .label(format!("`{}` is not writable: this faults at run time", symbol.section))
+            .note_at(symbol.span, "defined here")
+            .help(format!("define `{name}` in `.data` or `.bss`")),
         );
     }
 
@@ -196,26 +198,34 @@ fn access(
     {
         let bytes = bits / 8;
         let verb = if writes { "writes" } else { "reads" };
-        let consequence = if writes {
-            "the extra bytes overwrite whatever is defined after it"
-        } else {
-            "the extra bytes are whatever is defined after it"
+        let plural = if size == 1 { "" } else { "s" };
+        let mut diagnostic = Diagnostic::new(
+            &DATA_SIZE_MISMATCH,
+            operand.span,
+            format!("{verb} {bytes} bytes at `{name}`, which is {size} byte{plural}"),
+        )
+        .label(if writes { "overwrites what follows it" } else { "also reads what follows it" })
+        .note_at(symbol.span, format!("declared with `{}`", data.directive));
+        // A load into a register: widen it explicitly.
+        let keyword = match size {
+            1 => Some("byte"),
+            2 => Some("word"),
+            _ => None,
         };
-        out.push(
-            Diagnostic::new(
-                &DATA_SIZE_MISMATCH,
-                operand.span,
-                format!(
-                    "this {verb} {bytes} bytes, but `{name}` is {size} byte{} long (`{}`)",
-                    if size == 1 { "" } else { "s" },
-                    data.directive
-                ),
-            )
-            .note(consequence)
-            .help(format!(
-                "access it with the right size (`movzx` to widen a load), or declare `{name}` wider"
-            )),
-        );
+        if let (false, "mov", Some(dest), Some(keyword)) =
+            (writes, insn.ins.mnemonic.as_str(), other.and_then(Operand::as_reg), keyword)
+        {
+            let replacement =
+                format!("movzx {}, {keyword} {}", dest.id.name32(), cx.text(operand.span));
+            diagnostic = diagnostic
+                .replace(
+                    format!("load {size} byte{plural} and zero-extend"),
+                    insn.span,
+                    replacement,
+                )
+                .maybe_incorrect();
+        }
+        out.push(diagnostic);
     }
 }
 
@@ -264,18 +274,33 @@ fn immediate(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
         // not mask.
         let wide = mnemonic == "mov" && dest.as_reg().is_some();
         if !wide && i32::try_from(value).is_err() {
-            out.push(
-                Diagnostic::new(
-                    &IMMEDIATE_OUT_OF_RANGE,
-                    source.span,
-                    format!("`{text}` does not fit in the 32-bit immediate of `{mnemonic}`"),
-                )
-                .note(
-                    "the immediate is 32 bits wide and sign-extended to 64: \
-                     the assembler truncates anything larger",
-                )
-                .help("load the constant into a register with `mov` first"),
-            );
+            let mut diagnostic = Diagnostic::new(
+                &IMMEDIATE_OUT_OF_RANGE,
+                source.span,
+                format!("`{text}` does not fit in the 32-bit immediate of `{mnemonic}`"),
+            )
+            .label(if u32::try_from(value).is_ok() {
+                format!("sign-extended to {:#x}", value as u32 as i32 as i64)
+            } else {
+                "truncated to 32 bits".to_string()
+            });
+            // `and rax, 0xFFFFFFFF` means "keep the low half": a 32-bit
+            // move of the register onto itself does exactly that.
+            diagnostic = match (mnemonic, dest.as_reg(), value) {
+                ("and", Some(reg), 0xFFFF_FFFF) => {
+                    let low = reg.id.name32();
+                    let replacement = format!("mov {low}, {low}");
+                    diagnostic
+                        .replace(
+                            format!("keep the low 32 bits with `{replacement}`"),
+                            insn.span,
+                            replacement,
+                        )
+                        .maybe_incorrect()
+                }
+                _ => diagnostic.help("load the constant into a register with `mov` first"),
+            };
+            out.push(diagnostic);
         }
     } else if bits < 64 {
         let (min, max) = (-(1i64 << (bits - 1)), (1i64 << bits) - 1);
@@ -286,8 +311,7 @@ fn immediate(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
                     source.span,
                     format!("`{text}` does not fit in {bits} bits"),
                 )
-                .note(format!("the assembler keeps the low {bits} bits: {}", value & max))
-                .help(format!("a {bits}-bit operand holds {min} to {max}")),
+                .label(format!("stored as {}", value & max)),
             );
         }
     }

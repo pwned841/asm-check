@@ -40,12 +40,9 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 Diagnostic::new(
                     &UNKNOWN_SYSCALL,
                     insn.span,
-                    format!("there is no system call {number} on x86-64 Linux"),
+                    format!("no system call {number} on x86-64 Linux"),
                 )
-                .note(
-                    "`syscall` uses the 64-bit numbering (0 `read`, 1 `write`, 60 `exit`), \
-                     which differs from the 32-bit one used with `int 0x80`",
-                ),
+                .note("`syscall` uses the 64-bit numbers: 0 `read`, 1 `write`, 60 `exit`"),
             );
             continue;
         }
@@ -59,10 +56,9 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 Diagnostic::new(
                     &EXIT_CODE_TRUNCATED,
                     insn.span,
-                    format!("exit status {status} is reported as {}", status & 0xFF),
+                    format!("exit status {status} becomes {}", status & 0xFF),
                 )
-                .note("only the low 8 bits of the status reach the parent process")
-                .help("use a status between 0 and 255"),
+                .label("only the low 8 bits reach the parent process"),
             );
         }
 
@@ -95,15 +91,14 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             let mut diagnostic = Diagnostic::new(
                 &POINTER_FROM_CONTENTS,
                 source.span,
-                format!(
-                    "`{reg}` receives the bytes stored at `{name}`, not the address of `{name}`"
-                ),
+                format!("`{reg}` gets the contents of `{name}`, not its address"),
             )
-            .note(format!("`{}` expects a pointer in `{param}`", syscall.name))
+            .label(format!("`{}` expects a pointer in `{param}`", syscall.name))
             .help(format!("use `mov {reg}, {name}` or `lea {reg}, [rel {name}]`"));
             if !name.contains('.') {
-                diagnostic =
-                    diagnostic.replace(format!("use the address of `{name}`"), source.span, name);
+                diagnostic = diagnostic
+                    .replace(format!("pass the address of `{name}`"), source.span, name)
+                    .maybe_incorrect();
             }
             out.push(diagnostic);
         }

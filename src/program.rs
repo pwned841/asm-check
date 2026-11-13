@@ -152,6 +152,8 @@ pub struct Program<'a> {
     /// The file uses macros, includes or structures, so the symbol table
     /// built here may be incomplete.
     pub opaque: bool,
+    /// The source lines, when the caller provided them: lints quote them.
+    pub text: Vec<&'a str>,
     /// The file says `default rel`.
     pub default_rel: bool,
     /// Every `section` directive: its name and where it is.
@@ -178,6 +180,7 @@ impl<'a> Program<'a> {
             references: HashMap::new(),
             bits: 64,
             opaque: false,
+            text: Vec::new(),
             default_rel: false,
             sections: Vec::new(),
             stray_code: Vec::new(),
@@ -244,6 +247,16 @@ impl<'a> Program<'a> {
             }
             i -= 1;
         }
+    }
+
+    /// The source text a span covers, or nothing when it is not available.
+    pub fn snippet(&self, span: Span) -> &str {
+        self.text.get(span.line).and_then(|line| line.get(span.start..span.end)).unwrap_or("")
+    }
+
+    /// The index of the instruction on a source line.
+    pub fn at_line(&self, line: usize) -> Option<usize> {
+        self.insns.iter().position(|insn| insn.line == line)
     }
 
     /// The functions that contain `block`.

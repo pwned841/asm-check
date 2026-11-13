@@ -61,16 +61,13 @@ fn callee_saved(cx: &Context, out: &mut Vec<Diagnostic>) {
                 Diagnostic::new(
                     &CALLEE_SAVED_CLOBBERED,
                     insn.span,
-                    format!(
-                        "`{id}` is callee-saved, but `{}` changes it without restoring it",
-                        function.name
-                    ),
+                    format!("`{id}` is modified but not restored"),
                 )
-                .note("callers expect `rbx`, `rbp` and `r12`-`r15` to survive a call")
-                .help(format!(
-                    "`push {id}` on entry and `pop {id}` before every `ret`, \
-                     or use a caller-saved register"
-                )),
+                .label(format!(
+                    "callee-saved: the caller of `{}` expects it unchanged",
+                    function.name
+                ))
+                .help(format!("`push {id}` on entry and `pop {id}` before returning")),
             );
         }
     }
@@ -154,29 +151,35 @@ const ALL_REGISTERS: [RegId; 16] = [
 fn dead_store(cx: &Context, first: usize, second: usize, reg: Reg, by_syscall: bool) -> Diagnostic {
     let program = cx.program;
     let (store, killer) = (&program.insns[first], &program.insns[second]);
-    let line = killer.line + 1;
     if by_syscall {
         let mut diagnostic = Diagnostic::new(
             &DEAD_STORE,
             store.span,
-            format!("the value written to `{reg}` is destroyed by the `syscall` on line {line}"),
+            format!("`{reg}` is destroyed by `syscall` before being read"),
         )
+        .label("this value is lost")
         .note_at(killer.span, "`syscall` overwrites `rcx` and `r11`");
-        if reg.id == RegId::RCX {
+        // The classic slip: the 4th argument goes in `rcx` for a function
+        // and in `r10` for a system call.
+        if reg.id == RegId::RCX
+            && let Some(dest) = store.ins.operands.first()
+            && let Some(r10) = RegId::R10.name(reg.width)
+        {
             diagnostic = diagnostic
-                .help("the 4th system call argument goes in `r10`, not `rcx` as for functions");
+                .replace("pass the 4th system call argument in `r10`", dest.span, r10)
+                .maybe_incorrect();
         }
         return diagnostic;
     }
     let mut diagnostic = Diagnostic::new(
         &DEAD_STORE,
         store.span,
-        format!("the value written to `{reg}` is never read"),
+        format!("`{reg}` is overwritten before being read"),
     )
-    .note_at(killer.span, format!("it is overwritten by `{}` on line {line}", cx.code(killer)))
-    .help("remove this instruction, or check that it targets the register you meant");
+    .label("this value is never used")
+    .note_at(killer.span, "overwritten here");
     if program.lines[store.line].label.is_none() {
-        diagnostic = diagnostic.delete_line("remove the dead store", store.line);
+        diagnostic = diagnostic.delete_line("remove the dead store", store.line).maybe_incorrect();
     }
     diagnostic
 }

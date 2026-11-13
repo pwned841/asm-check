@@ -53,7 +53,8 @@ enum Def {
     /// Whatever the caller left there: a parameter, as far as we know.
     Input,
     /// Only the low bits were written since the register became undefined.
-    Partial(Width, Cause),
+    /// The last field is the line of that write.
+    Partial(Width, Cause, usize),
     Undefined(Cause),
 }
 
@@ -173,10 +174,10 @@ impl Analysis for Definedness<'_> {
                     }
                     *slot = Def::Defined; // report once
                 }
-                Def::Partial(written, cause) => {
+                Def::Partial(written, cause, line) => {
                     if read.bits > written.bits() {
                         if let Some(out) = out.as_deref_mut() {
-                            out.push(partial(program, index, &read, written, cause));
+                            out.push(partial(program, index, &read, written, cause, line));
                         }
                         *slot = Def::Defined;
                     }
@@ -192,8 +193,10 @@ impl Analysis for Definedness<'_> {
             }
             let width = fx.dest.filter(|dest| dest.id == id).map_or(Width::Low8, |dest| dest.width);
             *slot = match *slot {
-                Def::Undefined(cause) => Def::Partial(width, cause),
-                Def::Partial(old, cause) if width.bits() > old.bits() => Def::Partial(width, cause),
+                Def::Undefined(cause) => Def::Partial(width, cause, insn.line),
+                Def::Partial(old, cause, _) if width.bits() > old.bits() => {
+                    Def::Partial(width, cause, insn.line)
+                }
                 other => other,
             };
         }
@@ -304,82 +307,79 @@ fn reads(program: &Program, index: usize, inputs: &[RegSet]) -> Vec<Read> {
     reads
 }
 
-/// `the `syscall` takes `count`, its 3rd argument, in `rdx``, and so on.
+/// What the instruction does with the register, for the label under it.
 fn describe(program: &Program, index: usize, read: &Read) -> String {
     let insn = &program.insns[index];
-    let name = read.id.name64();
     match read.reason {
-        Reason::Operand => format!("`{name}` is read here"),
-        Reason::Implicit => format!("`{}` reads `{name}`", insn.ins.mnemonic),
-        Reason::SyscallNumber => "`syscall` takes the call number in `rax`".to_string(),
+        Reason::Operand => "read here".to_string(),
+        Reason::Implicit => format!("read by `{}`", insn.ins.mnemonic),
+        Reason::SyscallNumber => "read as the system call number".to_string(),
         Reason::SyscallArgument(syscall, position) => {
-            const ORDINALS: [&str; 6] = ["1st", "2nd", "3rd", "4th", "5th", "6th"];
-            format!(
-                "`{}` takes `{}`, its {} argument, in `{name}`",
-                syscall.name,
-                syscall.param(position),
-                ORDINALS[position]
-            )
+            format!("`{}` reads it as `{}`", syscall.name, syscall.param(position))
         }
-        Reason::Callee(callee) => {
-            format!("`{}` reads `{name}`", program.functions[callee].name)
-        }
+        Reason::Callee(callee) => format!("`{}` reads it", program.functions[callee].name),
     }
 }
 
 fn undefined(program: &Program, index: usize, read: &Read, cause: Cause) -> Diagnostic {
-    let what = describe(program, index, read);
     let name = read.id.name64();
+    let label = describe(program, index, read);
+    let span_of = |line: usize| program.at_line(line).map(|at| program.insns[at].span);
     match cause {
         Cause::Entry => {
-            let mut diagnostic = Diagnostic::new(
+            let diagnostic = Diagnostic::new(
                 &UNINITIALIZED_REGISTER,
                 read.span,
-                format!("{what}, but nothing has set it"),
+                format!("`{name}` is used uninitialized"),
             )
-            .note(
-                "no register except `rsp` has a specified value when the program starts; \
-                 it is often zero, which hides the bug",
-            );
-            diagnostic = match read.reason {
-                Reason::SyscallArgument(syscall, _) => diagnostic
-                    .help(format!("set `{name}` before the `syscall`: {}", syscall.signature())),
-                _ => diagnostic.help(format!("give `{name}` a value first")),
-            };
-            diagnostic
+            .label(label);
+            match read.reason {
+                Reason::SyscallArgument(syscall, _) => {
+                    diagnostic.help(format!("set `{name}` first: {}", syscall.signature()))
+                }
+                _ => diagnostic
+                    .help(format!("give it a value first, e.g. `xor {0}, {0}`", read.id.name32())),
+            }
         }
-        Cause::Syscall(line) => Diagnostic::new(
-            &CLOBBERED_REGISTER,
-            read.span,
-            format!("{what}, but the `syscall` on line {} destroyed its value", line + 1),
-        )
-        .note("the kernel uses `rcx` and `r11` to return from `syscall`: both are destroyed")
-        .help("keep the value in another register, or `push`/`pop` it around the `syscall`"),
-        Cause::Call(line, None) => Diagnostic::new(
-            &CLOBBERED_REGISTER,
-            read.span,
-            format!("{what}, but the call on line {} destroyed its value", line + 1),
-        )
-        .note(format!("`{name}` is caller-saved: a function is free to overwrite it"))
-        .help("keep the value in a callee-saved register (`rbx`, `r12`-`r15`) or on the stack"),
-        Cause::Call(line, Some(callee)) => {
-            let callee = &program.functions[callee];
-            let why = if callee.makes_syscall && abi::SYSCALL_CLOBBERS.contains(read.id) {
-                "runs `syscall`, which destroys `rcx` and `r11`"
-            } else {
-                "calls external code, which may overwrite caller-saved registers"
-            };
-            Diagnostic::new(
+        Cause::Syscall(line) => {
+            let mut diagnostic = Diagnostic::new(
                 &CLOBBERED_REGISTER,
                 read.span,
-                format!(
-                    "{what}, but the call to `{}` on line {} destroyed its value",
-                    callee.name,
-                    line + 1
-                ),
+                format!("`{name}` was destroyed by `syscall`"),
             )
-            .note(format!("`{}` {why}", callee.name))
-            .help("save the register in the callee, or keep the value somewhere else")
+            .label(label)
+            .help("keep the value in a register `syscall` preserves, such as `r12`");
+            if let Some(span) = span_of(line) {
+                diagnostic = diagnostic.note_at(span, "`syscall` overwrites `rcx` and `r11`");
+            }
+            diagnostic
+        }
+        Cause::Call(line, callee) => {
+            let (who, why) = match callee {
+                None => {
+                    ("a call".to_string(), format!("may overwrite `{name}`: it is caller-saved"))
+                }
+                Some(callee) => {
+                    let callee = &program.functions[callee];
+                    let why = if callee.makes_syscall && abi::SYSCALL_CLOBBERS.contains(read.id) {
+                        "runs `syscall`, which overwrites `rcx` and `r11`"
+                    } else {
+                        "calls external code, which may overwrite it"
+                    };
+                    (format!("`{}`", callee.name), format!("`{}` {why}", callee.name))
+                }
+            };
+            let mut diagnostic = Diagnostic::new(
+                &CLOBBERED_REGISTER,
+                read.span,
+                format!("`{name}` was destroyed by {who}"),
+            )
+            .label(label)
+            .help("keep the value in `rbx` or `r12`-`r15`, or save it on the stack");
+            if let Some(span) = span_of(line) {
+                diagnostic = diagnostic.note_at(span, why);
+            }
+            diagnostic
         }
     }
 }
@@ -390,24 +390,44 @@ fn partial(
     read: &Read,
     written: Width,
     cause: Cause,
+    line: usize,
 ) -> Diagnostic {
-    let what = describe(program, index, read);
-    let low = read.id.name(written).unwrap_or("its low bits");
+    let low = read.id.name(written).unwrap_or("the low bits");
     let rest = match cause {
-        Cause::Entry => "the rest was never set".to_string(),
-        Cause::Syscall(line) => {
-            format!("the rest is left over from the `syscall` on line {}", line + 1)
-        }
-        Cause::Call(line, _) => format!("the rest is left over from the call on line {}", line + 1),
+        Cause::Entry => "were never set".to_string(),
+        Cause::Syscall(at) => format!("are left over from the `syscall` on line {}", at + 1),
+        Cause::Call(at, _) => format!("are left over from the call on line {}", at + 1),
     };
-    Diagnostic::new(
+    let mut diagnostic = Diagnostic::new(
         &PARTIAL_REGISTER_READ,
         read.span,
-        format!("{what}, but only `{low}` was written: {rest}"),
+        format!("only `{low}` of `{}` holds a value", read.id.name64()),
     )
-    .note("writing an 8- or 16-bit register leaves the other bits of the 64-bit register as they were")
-    .help(format!(
-        "load the value with `movzx`, or clear the register first with `xor {0}, {0}`",
-        read.id.name32()
-    ))
+    .label(format!("{}: the other bits {rest}", describe(program, index, read)))
+    .help(format!("load with `movzx`, or clear `{}` first", read.id.name32()));
+
+    // The write that set the low bits: widen it when it is a plain load.
+    let Some(writer) = program.at_line(line).map(|at| &program.insns[at]) else {
+        return diagnostic;
+    };
+    diagnostic = diagnostic.note_at(writer.span, format!("only `{low}` is written here"));
+    if let ("mov", [dest, source]) = (writer.ins.mnemonic.as_str(), writer.ins.operands.as_slice())
+        && dest.as_reg().is_some_and(|reg| reg.id == read.id)
+    {
+        let wide = read.id.name32();
+        let (start, end) = (source.span.start, source.span.end);
+        let text = program.snippet(crate::span::Span::new(writer.line, start, end)).to_string();
+        let size = if written.bits() == 16 { "word" } else { "byte" };
+        let replacement = if source.constant().is_some() {
+            format!("mov {wide}, {text}")
+        } else if source.is_mem() && source.size.is_none() {
+            format!("movzx {wide}, {size} {text}")
+        } else {
+            format!("movzx {wide}, {text}")
+        };
+        diagnostic = diagnostic
+            .replace(format!("load the whole register: `{replacement}`"), writer.span, replacement)
+            .maybe_incorrect();
+    }
+    diagnostic
 }

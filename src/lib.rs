@@ -94,7 +94,8 @@ pub fn check(source: &str, config: &Config) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let lines = parser::parse(source);
-    let program = program::Program::build(&lines);
+    let mut program = program::Program::build(&lines);
+    program.text = source.lines().collect();
     if program.bits != 64 {
         return Vec::new();
     }

@@ -2,7 +2,7 @@
 
 use super::Context;
 use crate::ast::{Operand, OperandKind};
-use crate::diagnostic::{Diagnostic, Group, Lint};
+use crate::diagnostic::{Diagnostic, Edit, Group, Lint};
 use crate::insn::{Flags, Flow};
 use crate::program::Program;
 use crate::reg::Width;
@@ -92,10 +92,19 @@ fn neighbours(cx: &Context, out: &mut Vec<Diagnostic>) {
         };
 
         if mnemonic == "loop" {
-            out.push(
-                Diagnostic::new(&SLOW_LOOP, insn.span, "`loop` is slow on current processors")
-                    .help("use `dec rcx` followed by `jnz`"),
-            );
+            let mut diagnostic =
+                Diagnostic::new(&SLOW_LOOP, insn.span, "`loop` is slow on current processors");
+            if let Some(target) = operands.first() {
+                // Not safe: `dec` changes the flags, `loop` does not.
+                diagnostic = diagnostic
+                    .replace(
+                        "use `dec rcx` and `jnz`",
+                        insn.span,
+                        format!("dec rcx\njnz {}", cx.text(target.span)),
+                    )
+                    .maybe_incorrect();
+            }
+            out.push(diagnostic);
         }
 
         for operand in operands {
@@ -104,18 +113,22 @@ fn neighbours(cx: &Context, out: &mut Vec<Diagnostic>) {
                 && !mem.relative
                 && !program.default_rel
             {
-                let name = &mem.symbols[0];
-                out.push(
-                    Diagnostic::new(
-                        &ABSOLUTE_ADDRESS,
-                        operand.span,
-                        format!("`{}` is an absolute address", cx.text(operand.span)),
-                    )
-                    .note("position-independent executables need RIP-relative addressing")
-                    .help(format!(
-                        "write `[rel {name}]`, or put `default rel` at the top of the file"
-                    )),
-                );
+                let text = cx.text(operand.span);
+                let mut diagnostic = Diagnostic::new(
+                    &ABSOLUTE_ADDRESS,
+                    operand.span,
+                    format!("absolute address `{text}`"),
+                )
+                .label("not position-independent");
+                if let Some(bracket) = text.find('[') {
+                    let at = operand.span.start + bracket + 1;
+                    diagnostic = diagnostic.replace(
+                        "address it relative to `rip`",
+                        crate::span::Span::new(operand.span.line, at, at),
+                        "rel ",
+                    );
+                }
+                out.push(diagnostic);
             }
         }
 
@@ -146,14 +159,19 @@ fn neighbours(cx: &Context, out: &mut Vec<Diagnostic>) {
             && a.as_reg().is_some()
             && a.as_reg() == b.as_reg()
         {
-            out.push(
-                Diagnostic::new(
-                    &REDUNDANT_PUSH_POP,
-                    previous.span,
-                    format!("`{}` is undone by the `pop` that follows", cx.code(previous)),
-                )
-                .help("remove both instructions"),
-            );
+            let mut diagnostic = Diagnostic::new(
+                &REDUNDANT_PUSH_POP,
+                previous.span,
+                format!("`{}` is undone by the next instruction", cx.code(previous)),
+            )
+            .note_at(insn.span, "popped straight back");
+            if deletable(previous.line) && deletable(insn.line) {
+                diagnostic = diagnostic.fix(
+                    "remove both",
+                    vec![Edit::DeleteLine(previous.line), Edit::DeleteLine(insn.line)],
+                );
+            }
+            out.push(diagnostic);
         }
 
         if mnemonic == "mov"
@@ -166,9 +184,9 @@ fn neighbours(cx: &Context, out: &mut Vec<Diagnostic>) {
             let mut diagnostic = Diagnostic::new(
                 &REDUNDANT_MOVE,
                 insn.span,
-                format!("`{}` copies back what `{}` just copied", cx.code(insn), cx.code(previous)),
+                format!("`{}` copies the same value back", cx.code(insn)),
             )
-            .help("remove it: both already hold the same value");
+            .note_at(previous.span, "already copied here");
             if deletable(insn.line) {
                 diagnostic = diagnostic.delete_line("remove the redundant move", insn.line);
             }
@@ -244,10 +262,6 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                             insn.span,
                             format!("`{}` can be written `{replacement}`", cx.code(insn)),
                         )
-                        .note(
-                            "`xor` is the shorter, recognised way to zero a register; \
-                             unlike `mov` it changes the flags, which nothing reads here",
-                        )
                         .replace(
                             format!("use `{replacement}`"),
                             insn.span,
@@ -265,7 +279,6 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                         insn.span,
                         format!("`{replacement}` zeroes all of `{dest}` in one byte less"),
                     )
-                    .note("writing a 32-bit register clears the upper half of the 64-bit one")
                     .replace(
                         format!("use `{replacement}`"),
                         insn.span,
@@ -281,7 +294,6 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                         insn.span,
                         format!("`{}` can be written `{replacement}`", cx.code(insn)),
                     )
-                    .note("`test` sets the same flags for a comparison with zero and is shorter")
                     .replace(
                         format!("use `{replacement}`"),
                         insn.span,

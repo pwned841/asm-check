@@ -141,7 +141,8 @@ pub struct Program<'a> {
     /// Redefinitions: `(name, span, line of the first definition)`.
     pub duplicates: Vec<(String, Span, usize)>,
     pub globals: HashMap<String, Span>,
-    pub externs: HashSet<String>,
+    /// `extern` declarations and where they are.
+    pub externs: HashMap<String, Span>,
     /// Names introduced by `%define` and friends.
     pub defines: HashSet<String>,
     /// How many times each symbol is referenced.
@@ -153,8 +154,9 @@ pub struct Program<'a> {
     pub opaque: bool,
     /// Every `section` directive: its name and where it is.
     pub sections: Vec<(String, Span)>,
-    /// Instructions found in a data section: their span and the section.
-    pub stray_code: Vec<(Span, String)>,
+    /// Instructions found in a data section: their span, and the index in
+    /// `sections` of the directive that put them there.
+    pub stray_code: Vec<(Span, usize)>,
     /// Initialised data found in `.bss`.
     pub bss_data: Vec<Span>,
 }
@@ -169,7 +171,7 @@ impl<'a> Program<'a> {
             symbols: HashMap::new(),
             duplicates: Vec::new(),
             globals: HashMap::new(),
-            externs: HashSet::new(),
+            externs: HashMap::new(),
             defines: HashSet::new(),
             references: HashMap::new(),
             bits: 64,
@@ -296,7 +298,7 @@ impl<'a> Program<'a> {
                         *self.references.entry(symbol.clone()).or_default() += 1;
                     }
                     if !in_text {
-                        self.stray_code.push((stmt.span, section.clone()));
+                        self.stray_code.push((stmt.span, self.sections.len().saturating_sub(1)));
                         continue;
                     }
                     if std::mem::take(&mut break_run) {
@@ -348,7 +350,11 @@ impl<'a> Program<'a> {
                             self.globals.entry(name.clone()).or_insert(stmt.span);
                         }
                     }
-                    Directive::Extern(names) => self.externs.extend(names.iter().cloned()),
+                    Directive::Extern(names) => {
+                        for name in names {
+                            self.externs.entry(name.clone()).or_insert(stmt.span);
+                        }
+                    }
                     Directive::Bits(bits) => self.bits = *bits,
                     Directive::Other(name) => {
                         if matches!(name.as_str(), "struc" | "istruc" | "absolute") {

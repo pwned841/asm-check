@@ -48,11 +48,38 @@ mov counter, rax        ; a label is an address, not a location: [counter]
 cmp 5, rax              ; immediate first
 lea rax, rbx            ; lea needs a memory operand
 push eax                ; no 32-bit push in 64-bit mode
-and rax, 0xFFFFFFFF     ; immediates are 32-bit and sign-extended
 ```
 
-The last one assembles with a warning and does something else than intended:
-only `mov r64, imm64` takes a 64-bit immediate.
+### invalid-address
+
+A memory operand that no addressing mode can express. An address is
+`base + index*scale + displacement`, with 64-bit (or 32-bit) registers
+and a scale of 1, 2, 4 or 8.
+
+```nasm
+mov rax, [bx]               ; 16-bit register
+mov rax, [rax + rbx*3]      ; scale
+mov rax, [rax + rbx + rcx]  ; three registers
+mov rax, [rax + rsp*2]      ; rsp cannot be an index
+```
+
+### immediate-out-of-range
+
+An immediate that does not fit its operand. The assembler warns and keeps
+the low bits.
+
+```nasm
+mov al, 300             ; al holds 0-255: this stores 44
+and rax, 0xFFFFFFFF     ; sign-extended to 0xFFFFFFFFFFFFFFFF: masks nothing
+```
+
+The second case is the dangerous one: every instruction except
+`mov r64, imm64` takes at most a 32-bit immediate and sign-extends it.
+
+### jump-to-data
+
+A `jmp`, a conditional jump or a `call` targets a data label. The
+processor would execute the bytes of the data.
 
 ### undefined-symbol
 
@@ -196,6 +223,64 @@ mov rsi, [message]  ; the first 8 bytes of the text
 mov rsi, message    ; its address: what write expects
 ```
 
+### truncated-address
+
+A 32-bit register is used as an address, as in `[eax]`. The upper half of
+the pointer is dropped: it works for addresses below 4 GiB and crashes
+with a real stack or heap pointer. Not reported for `lea`, where 32-bit
+registers are a common arithmetic trick.
+
+### data-size-mismatch
+
+An access is wider than the data it names.
+
+```nasm
+flag db 0
+    mov rax, [flag]     ; reads 8 bytes from a 1-byte variable
+    mov [flag], rax     ; writes 8 bytes: overwrites what follows
+```
+
+Only reported for a direct `[label]` whose definition has a known size.
+
+### write-to-readonly
+
+A store to a label defined in `.rodata` or in `.text`. Both are mapped
+read-only: the store faults at run time.
+
+### shift-out-of-range
+
+A shift or rotate by a constant at least as large as its operand. The
+processor masks the count to 5 bits (6 for 64-bit operands), so
+`shl rax, 64` shifts by 0.
+
+### code-in-data-section
+
+Instructions appear after `section .data` or `section .bss`. They are
+assembled, but into a section that is not executable: usually a forgotten
+`section .text`.
+
+### data-in-bss
+
+`.bss` only reserves space. An initialised definition there (`db`, `dq`)
+has its values ignored: use `resb`-style reservations, or `.data`.
+
+### unknown-section
+
+A section name one typo away from a standard one: `text` without the dot,
+`.txt`, `.date`, `.bbs`, `.rodata:`. The assembler accepts any name and
+creates a new section with default attributes, which is not executable.
+
+### misplaced-length
+
+`len equ $ - msg` measures from `msg` to the current position. Placed
+after another definition, it counts that one too.
+
+```nasm
+first  db "hello"
+second db "world"
+first_len equ $ - first     ; 10, not 5
+```
+
 ### callee-saved-clobbered
 
 An exported function (`global`, or `main`) changes `rbx`, `rbp` or
@@ -270,6 +355,10 @@ point and falls back to the start of the section.
 ### unused-label
 
 A label or a data item that nothing refers to.
+
+### unused-extern
+
+An `extern` declaration for a symbol the file never uses.
 
 ### redundant-jump
 

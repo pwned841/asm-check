@@ -1,9 +1,23 @@
 //! Comparisons whose flags are lost before anything tests them.
 
 use super::Context;
+use crate::dataflow::{self, Analysis};
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::insn::{Flags, Flow};
-use crate::program::Insn;
+use crate::program::{Function, Insn, Program};
+
+pub static CONSTANT_COMPARISON: Lint = Lint {
+    name: "constant-comparison",
+    group: Group::Suspicious,
+    summary: "a comparison whose result never changes, such as `cmp rax, rax` or `test rax, 0`",
+};
+
+pub static UNDEFINED_FLAGS: Lint = Lint {
+    name: "undefined-flags",
+    group: Group::Suspicious,
+    summary: "a conditional jump with no `cmp`, `test` or arithmetic before it, such as \
+              `mov rax, [x]` followed by `jz`",
+};
 
 pub static FLAGS_CLOBBERED: Lint = Lint {
     name: "flags-clobbered",
@@ -29,6 +43,32 @@ struct Comparison {
 
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     let program = cx.program;
+    dataflow::run(program, &FlagsSet, out);
+    for insn in &program.insns {
+        let (Some(a), Some(b)) = (insn.ins.operands.first(), insn.ins.operands.get(1)) else {
+            continue;
+        };
+        let code = cx.code(insn);
+        match insn.ins.mnemonic.as_str() {
+            "cmp" if a.as_reg().is_some() && a.as_reg() == b.as_reg() => out.push(
+                Diagnostic::new(
+                    &CONSTANT_COMPARISON,
+                    insn.span,
+                    format!("`{code}` compares a register with itself: always equal"),
+                )
+                .help(format!("to check for zero, use `test {0}, {0}`", cx.text(a.span))),
+            ),
+            "test" if b.constant() == Some(0) => out.push(
+                Diagnostic::new(
+                    &CONSTANT_COMPARISON,
+                    insn.span,
+                    format!("`{code}` always gives zero: `test` ANDs its operands"),
+                )
+                .help("test against the bits you care about, or the operand against itself"),
+            ),
+            _ => {}
+        }
+    }
     for block in &program.blocks {
         let mut current: Option<Comparison> = None;
         for index in block.start..block.end {
@@ -50,11 +90,13 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 }
             }
 
-            // Calls and system calls leave the flags in an unspecified state.
-            let written = match fx.flow {
-                Flow::Call(_) | Flow::Syscall | Flow::Int(_) => Flags::ALL,
-                _ => fx.flags_written,
-            };
+            // A call leaves the flags unspecified: `undefined-flags` reports
+            // whatever tests them next.
+            if matches!(fx.flow, Flow::Call(_) | Flow::Int(_)) {
+                current = None;
+                continue;
+            }
+            let written = fx.flags_written;
             if written.is_empty() {
                 continue;
             }
@@ -125,4 +167,90 @@ fn clobbered(cx: &Context, reader: &Insn, comparison: usize, overwriter: usize) 
          the flags alone",
         cmp.ins.mnemonic, reader.ins.mnemonic
     ))
+}
+
+// --- undefined-flags -------------------------------------------------------
+
+/// Why the flags hold nothing meaningful. Lines are 0-based.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unset {
+    /// Nothing has set them since the program started.
+    Entry,
+    /// A call on this line left them unspecified.
+    Call(usize),
+}
+
+/// `None` when some instruction has set the flags.
+type FlagState = Option<Unset>;
+
+struct FlagsSet;
+
+impl Analysis for FlagsSet {
+    type State = FlagState;
+
+    fn entry(&self, _: &Program, function: &Function) -> FlagState {
+        // A function may be handed flags by its caller; the entry point is not.
+        function.entry_point.then_some(Unset::Entry)
+    }
+
+    fn unknown(&self) -> FlagState {
+        None
+    }
+
+    /// Unset only when unset on every path.
+    fn join(&self, a: &FlagState, b: &FlagState) -> FlagState {
+        if b.is_some() { *a } else { None }
+    }
+
+    fn transfer(
+        &self,
+        program: &Program,
+        index: usize,
+        state: &mut FlagState,
+        out: Option<&mut Vec<Diagnostic>>,
+    ) {
+        let insn = &program.insns[index];
+        let fx = &insn.fx;
+        if !fx.known {
+            *state = None;
+            return;
+        }
+        if !fx.flags_read.is_empty()
+            && let Some(why) = state.take()
+            && let Some(out) = out
+        {
+            out.push(undefined(program, index, why));
+        }
+        if let Flow::Call(_) = fx.flow {
+            *state = Some(Unset::Call(insn.line));
+        } else if !fx.flags_written.is_empty() {
+            *state = None;
+        }
+    }
+}
+
+fn undefined(program: &Program, index: usize, why: Unset) -> Diagnostic {
+    let insn = &program.insns[index];
+    let mnemonic = &insn.ins.mnemonic;
+    let since = match why {
+        Unset::Entry => "the program started".to_string(),
+        Unset::Call(line) => format!("the call on line {}", line + 1),
+    };
+    let mut diagnostic = Diagnostic::new(
+        &UNDEFINED_FLAGS,
+        insn.span,
+        format!("`{mnemonic}` tests the flags, but nothing has set them since {since}"),
+    );
+    // The usual cause: expecting a data move to set the zero flag.
+    let block = &program.blocks[insn.block];
+    if index > block.start {
+        let previous = &program.insns[index - 1].ins.mnemonic;
+        if matches!(
+            previous.as_str(),
+            "mov" | "movzx" | "movsx" | "lea" | "pop" | "push" | "xchg" | "not"
+        ) {
+            diagnostic = diagnostic.note(format!("`{previous}` does not change the flags"));
+        }
+    }
+    diagnostic.help(format!("put a `cmp` or a `test` right before `{mnemonic}`"))
 }

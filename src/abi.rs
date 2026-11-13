@@ -7,6 +7,11 @@ use crate::reg::{RegId, RegSet};
 pub const SYSCALL_INPUTS: RegSet =
     RegSet::of(&[RegId::RAX, RegId::RDI, RegId::RSI, RegId::RDX, RegId::R10, RegId::R8, RegId::R9]);
 
+/// The registers holding system call arguments, in order. The fourth is
+/// `r10`, where a function call uses `rcx`.
+pub const SYSCALL_ARGUMENTS: [RegId; 6] =
+    [RegId::RDI, RegId::RSI, RegId::RDX, RegId::R10, RegId::R8, RegId::R9];
+
 /// Registers the kernel destroys on `syscall`: `rcx` receives the return
 /// address and `r11` the saved flags.
 pub const SYSCALL_CLOBBERS: RegSet = RegSet::of(&[RegId::RCX, RegId::R11]);

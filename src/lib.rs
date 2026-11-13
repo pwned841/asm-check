@@ -12,6 +12,8 @@ pub mod abi;
 pub mod ast;
 pub mod dataflow;
 pub mod diagnostic;
+pub mod docs;
+pub mod ide;
 pub mod insn;
 pub mod lints;
 pub mod lsp;
@@ -22,6 +24,8 @@ pub mod reg;
 pub mod render;
 pub mod span;
 pub mod suppress;
+pub mod syscalls;
+pub mod text;
 
 pub use diagnostic::{Diagnostic, Group, Lint, Severity};
 

@@ -38,6 +38,22 @@ impl Flags {
     pub const fn intersects(self, other: Flags) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// The names of the flags in the set, e.g. `["CF", "ZF"]`.
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (Flags::CF, "CF"),
+            (Flags::PF, "PF"),
+            (Flags::AF, "AF"),
+            (Flags::ZF, "ZF"),
+            (Flags::SF, "SF"),
+            (Flags::OF, "OF"),
+        ]
+        .into_iter()
+        .filter(|(flag, _)| self.intersects(*flag))
+        .map(|(_, name)| name)
+        .collect()
+    }
 }
 
 /// Where a jump or call goes.

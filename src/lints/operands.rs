@@ -23,7 +23,7 @@ pub static INVALID_OPERANDS: Lint = Lint {
     name: "invalid-operands",
     group: Group::Correctness,
     summary: "operands an instruction cannot take: two memory operands, an immediate destination, \
-              a 64-bit immediate, `push eax`, ...",
+              `push eax`, ...",
 };
 
 const BINARY: &[&str] =
@@ -152,28 +152,6 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         return true;
     }
 
-    // Only `mov r64, imm64` has a 64-bit immediate. Everything else takes
-    // 32 bits and sign-extends, so `and rax, 0xFFFFFFFF` does not mask.
-    let narrow_immediate =
-        matches!(mnemonic, "add" | "sub" | "adc" | "sbb" | "and" | "or" | "xor" | "cmp" | "test")
-            || (mnemonic == "mov" && first.is_some_and(Operand::is_mem));
-    if narrow_immediate
-        && let (Some(a), Some(b)) = (first, second)
-        && a.bits() == Some(64)
-        && let Some(value) = b.constant()
-        && i32::try_from(value).is_err()
-    {
-        let text = cx.text(b.span);
-        let message = format!("`{text}` does not fit in the 32-bit immediate of `{mnemonic}`");
-        out.push(
-            Diagnostic::new(&INVALID_OPERANDS, b.span, message)
-                .note(
-                    "the immediate is 32 bits wide and sign-extended to 64: \
-                     the assembler truncates anything larger",
-                )
-                .help("load the constant into a register with `mov` first"),
-        );
-    }
     false
 }
 

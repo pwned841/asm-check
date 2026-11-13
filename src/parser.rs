@@ -53,10 +53,14 @@ fn parse_line(number: usize, raw: &str, parent: &mut String) -> Line {
         let special = word.starts_with("..");
         let local = word.starts_with('.') && !special;
         let name = if local { format!("{parent}{word}") } else { word.to_string() };
-        if !local && !special {
+        // A lone word without a colon is as likely a half-typed instruction
+        // as a label: it does not open a new scope for local labels.
+        let lone = !has_colon && code[after..].trim().is_empty();
+        if !local && !special && !lone {
             *parent = word.to_string();
         }
-        line.label = Some(Label { name, span: Span::new(number, pos, word_end), local });
+        line.label =
+            Some(Label { name, span: Span::new(number, pos, word_end), local, colon: has_colon });
         pos = skip_ws(code, if has_colon { after + 1 } else { after });
     }
     if pos < code.len() {
@@ -92,9 +96,16 @@ fn parse_statement(number: usize, code: &str, start: usize, parent: &str) -> Opt
     let rest = &code[rest_start..end];
 
     let kind = if is_data_directive(&head) {
-        StmtKind::Data { symbols: symbols_in(rest, parent) }
+        StmtKind::Data {
+            size: data_size(&head, rest),
+            directive: head,
+            symbols: symbols_in(rest, parent),
+        }
     } else if head == "equ" {
-        StmtKind::Equ { symbols: symbols_in(rest, parent) }
+        let here = tokenize(rest)
+            .iter()
+            .any(|token| matches!(token, Tok::Ident(name) if name.bytes().all(|b| b == b'$')));
+        StmtKind::Equ { symbols: symbols_in(rest, parent), here }
     } else if head == "times" {
         parse_times(number, code, rest_start, end, parent)
     } else if is_directive(&head) {
@@ -112,14 +123,59 @@ fn parse_times(number: usize, code: &str, start: usize, end: usize, parent: &str
     for (word_start, word_end) in words(code, start, end).into_iter().skip(1) {
         let word = code[word_start..word_end].to_ascii_lowercase();
         if is_data_directive(&word) {
-            break;
+            let count = evaluate(&tokenize(&code[start..word_start]));
+            let each = data_size(&word, &code[word_end..end]);
+            let size = count
+                .and_then(|count| u64::try_from(count).ok())
+                .zip(each)
+                .and_then(|(count, each)| count.checked_mul(each));
+            let symbols = symbols_in(&code[start..end], parent);
+            return StmtKind::Data { directive: word, symbols, size };
         }
         if is_known_mnemonic(&word) || is_prefix(&word) {
             let prefix = Some("times".to_string());
             return parse_instruction(number, code, word_start, end, prefix, parent);
         }
     }
-    StmtKind::Data { symbols: symbols_in(&code[start..end], parent) }
+    StmtKind::Data {
+        directive: "times".to_string(),
+        symbols: symbols_in(&code[start..end], parent),
+        size: None,
+    }
+}
+
+/// Bytes occupied by a data directive, when its operands determine it.
+fn data_size(directive: &str, operands: &str) -> Option<u64> {
+    let unit: u64 = match directive {
+        "db" | "resb" => 1,
+        "dw" | "resw" => 2,
+        "dd" | "resd" => 4,
+        "dq" | "resq" => 8,
+        "dt" | "rest" => 10,
+        "do" | "reso" => 16,
+        "dy" | "resy" => 32,
+        "dz" | "resz" => 64,
+        _ => return None,
+    };
+    if directive.starts_with("res") {
+        let count = evaluate(&tokenize(operands))?;
+        return u64::try_from(count).ok()?.checked_mul(unit);
+    }
+    let mut total = 0u64;
+    for (start, end) in split_operands(operands, 0, operands.len()) {
+        let tokens = tokenize(&operands[start..end]);
+        let repeats =
+            |token: &Tok| matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("dup"));
+        if tokens.iter().any(repeats) {
+            return None;
+        }
+        total += match tokens.as_slice() {
+            // A string is padded to a multiple of the unit.
+            [Tok::Str(bytes)] => (bytes.len() as u64).div_ceil(unit) * unit,
+            _ => unit,
+        };
+    }
+    Some(total)
 }
 
 fn parse_instruction(
@@ -161,6 +217,7 @@ fn parse_directive(head: &str, rest: &str) -> Directive {
         "use16" => Directive::Bits(16),
         "use32" => Directive::Bits(32),
         "use64" => Directive::Bits(64),
+        "default" if rest.to_ascii_lowercase().contains("rel") => Directive::DefaultRel,
         _ => Directive::Other(head.to_string()),
     }
 }
@@ -196,7 +253,35 @@ fn parse_operand(text: &str, span: Span, parent: &str) -> Operand {
     collect_names(rest, parent, &mut regs, &mut symbols);
 
     let kind = if rest.contains(&Tok::Punct('[')) {
-        OperandKind::Mem(Mem { regs, symbols })
+        let mut scales = Vec::new();
+        for window in rest.windows(3) {
+            let (reg, factor) = match window {
+                [Tok::Ident(name), Tok::Punct('*'), Tok::Num(Some(factor))]
+                | [Tok::Num(Some(factor)), Tok::Punct('*'), Tok::Ident(name)] => {
+                    (Reg::parse(name), *factor)
+                }
+                _ => continue,
+            };
+            scales.extend(reg.map(|reg| (reg, factor)));
+        }
+        let relative = rest.iter().any(|token| {
+            matches!(token, Tok::Ident(word)
+                if word.eq_ignore_ascii_case("rel") || word.eq_ignore_ascii_case("rip"))
+        });
+        // What is inside the brackets, keywords aside.
+        let inner: Vec<&Tok> = rest
+            .iter()
+            .take_while(
+                |token| !matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("wrt")),
+            )
+            .filter(|token| match token {
+                Tok::Punct('[' | ']') => false,
+                Tok::Ident(word) => !is_operand_keyword(&word.to_ascii_lowercase()),
+                _ => true,
+            })
+            .collect();
+        let direct = matches!(inner.as_slice(), [Tok::Ident(_)]) && symbols.len() == 1;
+        OperandKind::Mem(Mem { regs, symbols, scales, direct, relative })
     } else if let [Tok::Ident(name)] = rest
         && let Some(reg) = Reg::parse(name)
     {
@@ -264,7 +349,9 @@ fn tokenize(text: &str) -> Vec<Tok> {
             let body = i + 1;
             let close =
                 bytes[body..].iter().position(|&b| b == c).map_or(bytes.len(), |p| body + p);
-            tokens.push(Tok::Str(bytes[body..close].to_vec()));
+            let raw = &bytes[body..close];
+            // Only backquoted strings interpret C-style escapes.
+            tokens.push(Tok::Str(if c == b'`' { unescape(raw) } else { raw.to_vec() }));
             i = close + 1;
         } else if c.is_ascii_digit() {
             let end = ident_end(text, i);
@@ -282,8 +369,49 @@ fn tokenize(text: &str) -> Vec<Tok> {
     tokens
 }
 
+/// Resolves the escapes of a backquoted string: `\n`, `\0`, `\x41`, ...
+fn unescape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'\\' || i + 1 == raw.len() {
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let digits = |from: usize, max: usize, radix: u32| {
+            raw[from..].iter().take(max).take_while(|b| (**b as char).is_digit(radix)).count()
+        };
+        let (byte, used) = match raw[i] {
+            b'n' => (b'\n', 1),
+            b't' => (b'\t', 1),
+            b'r' => (b'\r', 1),
+            b'a' => (7, 1),
+            b'b' => (8, 1),
+            b'v' => (11, 1),
+            b'f' => (12, 1),
+            b'e' => (27, 1),
+            b'x' | b'X' => {
+                let count = digits(i + 1, 2, 16);
+                let text = std::str::from_utf8(&raw[i + 1..i + 1 + count]).unwrap_or("");
+                (u8::from_str_radix(text, 16).unwrap_or(b'x'), 1 + count)
+            }
+            b'0'..=b'7' => {
+                let count = digits(i, 3, 8);
+                let text = std::str::from_utf8(&raw[i..i + count]).unwrap_or("");
+                (u8::from_str_radix(text, 8).unwrap_or(0), count)
+            }
+            other => (other, 1),
+        };
+        out.push(byte);
+        i += used;
+    }
+    out
+}
+
 /// Parses a NASM numeric literal: `42`, `0x2a`, `2ah`, `0b101`, `101b`, `0o17`, `17q`.
-fn parse_number(literal: &str) -> Option<i64> {
+pub(crate) fn parse_number(literal: &str) -> Option<i64> {
     let text = literal.replace('_', "").to_ascii_lowercase();
     let radix = |digits: &str, radix: u32| {
         u64::from_str_radix(digits, radix).ok().map(|value| value as i64)
@@ -391,7 +519,7 @@ impl Evaluator<'_> {
     }
 }
 
-fn is_ident_byte(b: u8) -> bool {
+pub(crate) fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(b, b'_' | b'.' | b'$' | b'#' | b'@' | b'~' | b'?')
         || b >= 0x80
@@ -417,7 +545,7 @@ fn skip_ws(text: &str, start: usize) -> usize {
 }
 
 /// Byte offset of the `;` that starts the comment, or the line length.
-fn comment_start(line: &str) -> usize {
+pub(crate) fn comment_start(line: &str) -> usize {
     let mut quote = None;
     for (i, b) in line.bytes().enumerate() {
         match quote {
@@ -552,17 +680,56 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_word_does_not_open_a_scope() {
+        let lines = parse("main:\n.loop:\n    mo\n    jmp .loop\n");
+        let StmtKind::Instruction(ins) = &lines[3].stmt.as_ref().unwrap().kind else { panic!() };
+        assert_eq!(ins.operands[0].symbols(), ["main.loop".to_string()]);
+    }
+
+    #[test]
     fn memory_operands() {
         let ins = instruction("cmp dword [buffer + r15*4 + 8], '1337'");
         let OperandKind::Mem(mem) = &ins.operands[0].kind else { panic!("expected memory") };
         assert_eq!(ins.operands[0].size, Some(32));
         assert_eq!(mem.regs, vec![Reg::new(RegId::R15, Width::W64)]);
         assert_eq!(mem.symbols, vec!["buffer".to_string()]);
+        assert_eq!(mem.scales, vec![(Reg::new(RegId::R15, Width::W64), 4)]);
+        assert!(!mem.direct && !mem.relative);
         assert_eq!(ins.operands[1].constant(), Some(0x3733_3331));
 
         let ins = instruction("mov rax, qword ptr [rel msg wrt ..got]");
         assert_eq!(ins.operands[1].symbols(), ["msg".to_string()]);
         assert_eq!(ins.operands[1].size, Some(64));
+        let OperandKind::Mem(mem) = &ins.operands[1].kind else { panic!("expected memory") };
+        assert!(mem.direct && mem.relative);
+    }
+
+    #[test]
+    fn data_sizes() {
+        let size = |source: &str| match line(source).stmt.unwrap().kind {
+            StmtKind::Data { size, .. } => size,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(size("flag db 0"), Some(1));
+        assert_eq!(size("msg db 'hello', 10, 0"), Some(7));
+        assert_eq!(size("pair dq 1, 2"), Some(16));
+        assert_eq!(size("wide dw 'abc'"), Some(4));
+        assert_eq!(size("value dd 1.5"), Some(4));
+        assert_eq!(size("buffer resb 64"), Some(64));
+        assert_eq!(size("table resq 4 * 2"), Some(64));
+        assert_eq!(size("zeros times 16 db 0"), Some(16));
+        assert_eq!(size("pad times 510-($-$$) db 0"), None);
+        assert_eq!(size("blob incbin 'file.bin'"), None);
+    }
+
+    #[test]
+    fn equ_with_current_position() {
+        let here = |source: &str| match line(source).stmt.unwrap().kind {
+            StmtKind::Equ { here, .. } => here,
+            other => panic!("expected equ, got {other:?}"),
+        };
+        assert!(here("len equ $ - msg"));
+        assert!(!here("SIZE equ 8 * 4"));
     }
 
     #[test]
@@ -577,6 +744,9 @@ mod tests {
         assert_eq!(value("1 << 4 | 3"), Some(19));
         assert_eq!(value("'A'"), Some(65));
         assert_eq!(value("','"), Some(44));
+        assert_eq!(value("`0\\n`"), Some(0x0A30));
+        assert_eq!(value("`\\x41\\101\\\\`"), Some(0x5C_4141));
+        assert_eq!(value("'0\\n'"), Some(0x6E_5C30));
         assert_eq!(value("number + 31"), None);
         assert_eq!(value("$ - 4"), None);
         assert_eq!(value("1.5"), None);

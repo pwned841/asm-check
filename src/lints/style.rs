@@ -1,7 +1,7 @@
 //! Instructions that work but have a shorter or clearer form.
 
 use super::Context;
-use crate::ast::Operand;
+use crate::ast::{Operand, OperandKind};
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::insn::{Flags, Flow};
 use crate::program::Program;
@@ -37,7 +37,188 @@ pub static NEEDLESS_REX: Lint = Lint {
     summary: "`xor r64, r64`, which the 32-bit form does in one byte less",
 };
 
+pub static LEA_AS_MOV: Lint = Lint {
+    name: "lea-as-mov",
+    group: Group::Style,
+    summary: "`lea reg, [other]` with a bare register, which is just `mov reg, other`",
+};
+
+pub static REDUNDANT_TEST: Lint = Lint {
+    name: "redundant-test",
+    group: Group::Style,
+    summary: "a `test reg, reg` right after arithmetic that already set the flags for `reg`",
+};
+
+pub static REDUNDANT_PUSH_POP: Lint = Lint {
+    name: "redundant-push-pop",
+    group: Group::Style,
+    summary: "`push reg` immediately followed by `pop reg`",
+};
+
+pub static REDUNDANT_MOVE: Lint = Lint {
+    name: "redundant-move",
+    group: Group::Style,
+    summary: "a `mov` that copies back what the previous `mov` just copied",
+};
+
+pub static SLOW_LOOP: Lint = Lint {
+    name: "slow-loop",
+    group: Group::Pedantic,
+    summary: "the `loop` instruction, slower than `dec` and `jnz` on current processors",
+};
+
+pub static ABSOLUTE_ADDRESS: Lint = Lint {
+    name: "absolute-address",
+    group: Group::Pedantic,
+    summary: "`[label]` without `rel`, which is not position-independent",
+};
+
+/// Lints that look at an instruction and its neighbour.
+fn neighbours(cx: &Context, out: &mut Vec<Diagnostic>) {
+    let program = cx.program;
+    for (index, insn) in program.insns.iter().enumerate() {
+        if cx.uses_define(insn) {
+            continue;
+        }
+        let mnemonic = insn.ins.mnemonic.as_str();
+        let operands = &insn.ins.operands;
+        let deletable = |line: usize| program.lines[line].label.is_none();
+        // The instruction right before, when nothing can jump in between.
+        let previous = (index > 0)
+            .then(|| &program.insns[index - 1])
+            .filter(|previous| insn.labels.is_empty() && previous.run == insn.run);
+        let normalise = |operand: &Operand| {
+            cx.text(operand.span).replace(char::is_whitespace, "").to_lowercase()
+        };
+
+        if mnemonic == "loop" {
+            out.push(
+                Diagnostic::new(&SLOW_LOOP, insn.span, "`loop` is slow on current processors")
+                    .help("use `dec rcx` followed by `jnz`"),
+            );
+        }
+
+        for operand in operands {
+            if let OperandKind::Mem(mem) = &operand.kind
+                && mem.direct
+                && !mem.relative
+                && !program.default_rel
+            {
+                let name = &mem.symbols[0];
+                out.push(
+                    Diagnostic::new(
+                        &ABSOLUTE_ADDRESS,
+                        operand.span,
+                        format!("`{}` is an absolute address", cx.text(operand.span)),
+                    )
+                    .note("position-independent executables need RIP-relative addressing")
+                    .help(format!(
+                        "write `[rel {name}]`, or put `default rel` at the top of the file"
+                    )),
+                );
+            }
+        }
+
+        if mnemonic == "lea"
+            && let (Some(dest), Some(source)) = (operands.first(), operands.get(1))
+            && let (Some(to), OperandKind::Mem(mem)) = (dest.as_reg(), &source.kind)
+            && let [from] = mem.regs.as_slice()
+            && to.width == from.width
+            && normalise(source) == format!("[{from}]")
+        {
+            let replacement = format!("mov {to}, {from}");
+            out.push(
+                Diagnostic::new(
+                    &LEA_AS_MOV,
+                    insn.span,
+                    format!("`{}` is just `{replacement}`", cx.code(insn)),
+                )
+                .replace(format!("use `{replacement}`"), insn.span, replacement),
+            );
+        }
+
+        let Some(previous) = previous else { continue };
+        let before = previous.ins.mnemonic.as_str();
+
+        if mnemonic == "pop"
+            && before == "push"
+            && let (Some(a), Some(b)) = (previous.ins.operands.first(), operands.first())
+            && a.as_reg().is_some()
+            && a.as_reg() == b.as_reg()
+        {
+            out.push(
+                Diagnostic::new(
+                    &REDUNDANT_PUSH_POP,
+                    previous.span,
+                    format!("`{}` is undone by the `pop` that follows", cx.code(previous)),
+                )
+                .help("remove both instructions"),
+            );
+        }
+
+        if mnemonic == "mov"
+            && before == "mov"
+            && let ([a, b], [c, d]) = (previous.ins.operands.as_slice(), operands.as_slice())
+            && normalise(a) == normalise(d)
+            && normalise(b) == normalise(c)
+            && !(a.is_mem() && b.is_mem())
+        {
+            let mut diagnostic = Diagnostic::new(
+                &REDUNDANT_MOVE,
+                insn.span,
+                format!("`{}` copies back what `{}` just copied", cx.code(insn), cx.code(previous)),
+            )
+            .help("remove it: both already hold the same value");
+            if deletable(insn.line) {
+                diagnostic = diagnostic.delete_line("remove the redundant move", insn.line);
+            }
+            out.push(diagnostic);
+        }
+
+        // `dec rcx` / `test rcx, rcx` / `jz`: the arithmetic already set ZF and SF.
+        let tested = match (mnemonic, operands.as_slice()) {
+            ("test", [a, b]) if a.as_reg().is_some() && a.as_reg() == b.as_reg() => a.as_reg(),
+            ("cmp", [a, b]) if b.constant() == Some(0) => a.as_reg(),
+            _ => None,
+        };
+        let sets_result_flags =
+            matches!(before, "add" | "sub" | "and" | "or" | "xor" | "neg" | "inc" | "dec");
+        if let Some(reg) = tested
+            && sets_result_flags
+            && !previous.fx.zeroing
+            && previous.fx.dest == Some(reg)
+        {
+            // CF and OF differ between the arithmetic and a `test`: only
+            // suggest when what follows looks at the result flags alone.
+            let result = Flags::ZF.union(Flags::SF).union(Flags::PF);
+            let block = &program.blocks[insn.block];
+            let reader = program.insns[index + 1..block.end].iter().find(|later| {
+                !later.fx.flags_read.is_empty() || !later.fx.flags_written.is_empty()
+            });
+            if reader.is_some_and(|later| {
+                !later.fx.flags_read.is_empty() && later.fx.flags_read.difference(result).is_empty()
+            }) {
+                let mut diagnostic = Diagnostic::new(
+                    &REDUNDANT_TEST,
+                    insn.span,
+                    format!(
+                        "`{}` already set the flags this `{mnemonic}` computes",
+                        cx.code(previous)
+                    ),
+                )
+                .help("remove it and branch on the flags of the arithmetic");
+                if deletable(insn.line) {
+                    diagnostic =
+                        diagnostic.delete_line(format!("remove the `{mnemonic}`"), insn.line);
+                }
+                out.push(diagnostic);
+            }
+        }
+    }
+}
+
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
+    neighbours(cx, out);
     let program = cx.program;
     for (index, insn) in program.insns.iter().enumerate() {
         if cx.uses_define(insn) {

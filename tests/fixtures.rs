@@ -121,3 +121,20 @@ fn every_lint_is_documented() {
     let existing: BTreeSet<&str> = lints::ALL.iter().map(|lint| lint.name).collect();
     assert_eq!(documented, existing, "docs/lints.md and the lint list disagree");
 }
+
+/// `examples/showcase.s` is the file to open to see the tool at work: it
+/// must trigger every lint. `entry-not-global` is the one exception, since
+/// the showcase needs its `_start` exported for everything else to apply.
+#[test]
+fn showcase_triggers_every_lint() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/showcase.s");
+    let source = fs::read_to_string(path).unwrap();
+    let config = Config { pedantic: true, ..Config::default() };
+    let hit: BTreeSet<&str> = check(&source, &config).iter().map(|d| d.lint.name).collect();
+    let missing: Vec<&str> = lints::ALL
+        .iter()
+        .map(|lint| lint.name)
+        .filter(|name| !hit.contains(name) && *name != "entry-not-global")
+        .collect();
+    assert!(missing.is_empty(), "examples/showcase.s does not trigger {missing:?}");
+}

@@ -24,6 +24,9 @@ pub struct Label {
     pub name: String,
     pub span: Span,
     pub local: bool,
+    /// Written with a colon. Without one, a lone word may be a misspelt
+    /// instruction rather than a label.
+    pub colon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,13 +38,20 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Instruction(Instruction),
-    /// `db`, `dq`, `resb`, `incbin`, ... `symbols` are the names referenced.
+    /// `db`, `dq`, `resb`, `incbin`, ...
     Data {
+        /// Lowercased directive, e.g. `db`.
+        directive: String,
+        /// Names referenced by the initialisers.
         symbols: Vec<String>,
+        /// Bytes occupied, when the directive and its operands say so.
+        size: Option<u64>,
     },
     /// `name equ expr`.
     Equ {
         symbols: Vec<String>,
+        /// The expression uses `$`, the current position.
+        here: bool,
     },
     Directive(Directive),
     /// A `%`-prefixed preprocessor line. `name` is the symbol it introduces,
@@ -58,6 +68,8 @@ pub enum Directive {
     Global(Vec<String>),
     Extern(Vec<String>),
     Bits(u32),
+    /// `default rel`: memory operands are RIP-relative unless stated.
+    DefaultRel,
     Other(String),
 }
 
@@ -103,6 +115,12 @@ pub struct Mem {
     /// Registers used to compute the address.
     pub regs: Vec<Reg>,
     pub symbols: Vec<String>,
+    /// Scaled registers: `rcx*8` gives `(rcx, 8)`.
+    pub scales: Vec<(Reg, i64)>,
+    /// The address is exactly one symbol: `[counter]`, `[rel counter]`.
+    pub direct: bool,
+    /// Addressed relative to the instruction pointer (`rel`, or `rip`).
+    pub relative: bool,
 }
 
 impl Operand {

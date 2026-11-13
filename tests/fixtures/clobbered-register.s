@@ -23,7 +23,7 @@ _start:
     call puts
     mov al, [rsi]           ;~
     mov rdi, rax
-    call print
+    call print              ;~
     mov rbx, r11            ;~
     mov rcx, 5
     call quiet

@@ -154,6 +154,11 @@ impl fmt::Display for Reg {
     }
 }
 
+/// Every general-purpose register name, at every width.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    NAMES64.into_iter().chain(NAMES32).chain(NAMES16).chain(NAMES8).chain(NAMES8_HIGH)
+}
+
 /// Whether `name` is a register outside the general-purpose set
 /// (vector, x87, segment, control, mask, instruction pointer).
 pub fn is_other_register(name: &str) -> bool {

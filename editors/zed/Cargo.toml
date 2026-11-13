@@ -1,0 +1,16 @@
+[package]
+name = "zed-asm-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+# Built by Zed for WebAssembly, not part of the asm-check workspace.
+[workspace]

@@ -1,0 +1,13 @@
+id = "asm-check"
+name = "asm-check"
+description = "Semantic lints for x86-64 assembly (NASM / Intel syntax)."
+version = "0.1.0"
+schema_version = 1
+authors = ["pwned841"]
+repository = "https://github.com/pwned841/asm-check"
+
+# The "Assembly" language itself (grammar, highlighting) comes from the
+# `assembly` extension; this one only adds a language server to it.
+[language_servers.asm-check]
+name = "asm-check"
+languages = ["Assembly"]

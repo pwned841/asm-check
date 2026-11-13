@@ -1,5 +1,8 @@
 //! The lints. Each submodule declares its [`Lint`]s and a `check` pass.
 
+pub mod operands;
+pub mod symbols;
+
 use crate::diagnostic::{Diagnostic, Lint};
 use crate::program::{Insn, Program};
 use crate::span::Span;
@@ -36,9 +39,17 @@ impl Context<'_> {
 type Pass = fn(&Context, &mut Vec<Diagnostic>);
 
 /// Every lint, in the order `asm-check lints` prints them.
-pub static ALL: &[&Lint] = &[];
+pub static ALL: &[&Lint] = &[
+    &operands::OPERAND_SIZE_MISMATCH,
+    &operands::AMBIGUOUS_OPERAND_SIZE,
+    &operands::INVALID_OPERANDS,
+    &symbols::UNDEFINED_SYMBOL,
+    &symbols::DUPLICATE_LABEL,
+    &symbols::ENTRY_NOT_GLOBAL,
+    &symbols::UNUSED_LABEL,
+];
 
-const PASSES: &[Pass] = &[];
+const PASSES: &[Pass] = &[operands::check, symbols::check];
 
 pub fn run(context: &Context) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();

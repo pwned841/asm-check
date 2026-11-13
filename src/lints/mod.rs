@@ -1,5 +1,6 @@
 //! The lints. Each submodule declares its [`Lint`]s and a `check` pass.
 
+pub mod calls;
 pub mod control;
 pub mod definedness;
 pub mod division;
@@ -12,6 +13,7 @@ pub mod stack;
 pub mod style;
 pub mod symbols;
 pub mod syscall;
+pub mod typos;
 
 use crate::diagnostic::{Diagnostic, Lint};
 use crate::program::{Insn, Program};
@@ -56,10 +58,15 @@ pub static ALL: &[&Lint] = &[
     &memory::INVALID_ADDRESS,
     &memory::IMMEDIATE_OUT_OF_RANGE,
     &sections::JUMP_TO_DATA,
+    &typos::UNKNOWN_INSTRUCTION,
     &symbols::UNDEFINED_SYMBOL,
     &symbols::DUPLICATE_LABEL,
     &stack::UNBALANCED_STACK,
     &stack::MISALIGNED_CALL,
+    &stack::MISMATCHED_POP,
+    &stack::ODD_STACK_ADJUSTMENT,
+    &calls::VARIADIC_CALL_WITHOUT_AL,
+    &calls::MAIN_RETURN_VALUE,
     &control::RET_IN_START,
     &control::FALLTHROUGH,
     &control::UNREACHABLE_CODE,
@@ -84,20 +91,31 @@ pub static ALL: &[&Lint] = &[
     &registers::CALLEE_SAVED_CLOBBERED,
     &registers::DEAD_STORE,
     &flags::UNDEFINED_FLAGS,
+    &flags::CONSTANT_COMPARISON,
     &flags::FLAGS_CLOBBERED,
     &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
     &sections::UNUSED_EXTERN,
     &control::REDUNDANT_JUMP,
+    &control::JUMP_OVER_JUMP,
+    &control::JUMP_TO_JUMP,
     &style::MOV_ZERO,
     &style::CMP_ZERO,
     &style::SELF_MOVE,
     &style::NOOP_ARITHMETIC,
+    &style::LEA_AS_MOV,
+    &style::REDUNDANT_TEST,
+    &style::REDUNDANT_PUSH_POP,
+    &style::REDUNDANT_MOVE,
     &style::NEEDLESS_REX,
+    &style::SLOW_LOOP,
+    &style::ABSOLUTE_ADDRESS,
 ];
 
 const PASSES: &[Pass] = &[
     operands::check,
+    typos::check,
+    calls::check,
     memory::check,
     sections::check,
     symbols::check,

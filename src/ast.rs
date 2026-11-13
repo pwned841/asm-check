@@ -24,6 +24,9 @@ pub struct Label {
     pub name: String,
     pub span: Span,
     pub local: bool,
+    /// Written with a colon. Without one, a lone word may be a misspelt
+    /// instruction rather than a label.
+    pub colon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +68,8 @@ pub enum Directive {
     Global(Vec<String>),
     Extern(Vec<String>),
     Bits(u32),
+    /// `default rel`: memory operands are RIP-relative unless stated.
+    DefaultRel,
     Other(String),
 }
 

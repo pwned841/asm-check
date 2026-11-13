@@ -152,6 +152,8 @@ pub struct Program<'a> {
     /// The file uses macros, includes or structures, so the symbol table
     /// built here may be incomplete.
     pub opaque: bool,
+    /// The file says `default rel`.
+    pub default_rel: bool,
     /// Every `section` directive: its name and where it is.
     pub sections: Vec<(String, Span)>,
     /// Instructions found in a data section: their span, and the index in
@@ -176,6 +178,7 @@ impl<'a> Program<'a> {
             references: HashMap::new(),
             bits: 64,
             opaque: false,
+            default_rel: false,
             sections: Vec::new(),
             stray_code: Vec::new(),
             bss_data: Vec::new(),
@@ -356,6 +359,7 @@ impl<'a> Program<'a> {
                         }
                     }
                     Directive::Bits(bits) => self.bits = *bits,
+                    Directive::DefaultRel => self.default_rel = true,
                     Directive::Other(name) => {
                         if matches!(name.as_str(), "struc" | "istruc" | "absolute") {
                             self.opaque = true;

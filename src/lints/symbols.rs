@@ -4,6 +4,7 @@ use super::Context;
 use crate::abi;
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::program::SymbolKind;
+use crate::{reg, text};
 
 pub static UNDEFINED_SYMBOL: Lint = Lint {
     name: "undefined-symbol",
@@ -83,9 +84,15 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 operand.span,
                 format!("undefined symbol `{name}`"),
             );
-            diagnostic = match closest(name, program.symbols.keys().chain(program.externs.keys())) {
-                Some(similar) => diagnostic.help(format!("did you mean `{similar}`?")),
-                None => diagnostic.help(format!(
+            let budget = (name.chars().count() / 3).max(1);
+            let labels = program.symbols.keys().chain(program.externs.keys()).map(String::as_str);
+            let register = text::closest(name, reg::names(), 1);
+            diagnostic = match (register, text::closest(name, labels, budget)) {
+                (Some(register), _) => {
+                    diagnostic.help(format!("did you mean the register `{register}`?"))
+                }
+                (None, Some(similar)) => diagnostic.help(format!("did you mean `{similar}`?")),
+                (None, None) => diagnostic.help(format!(
                     "define the label, or declare `extern {name}` if it lives in another file"
                 )),
             };
@@ -109,51 +116,5 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             _ => format!("`{text}` is never used"),
         };
         out.push(Diagnostic::new(&UNUSED_LABEL, symbol.span, message));
-    }
-}
-
-/// The candidate closest to `name`, if it is close enough to be a typo.
-fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a String>) -> Option<&'a str> {
-    let budget = (name.chars().count() / 3).max(1);
-    candidates
-        .map(|candidate| (edit_distance(name, candidate), candidate.as_str()))
-        .filter(|(distance, _)| *distance <= budget)
-        .min()
-        .map(|(_, candidate)| candidate)
-}
-
-/// Levenshtein distance.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut diagonal = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let substitution = diagonal + usize::from(ca != *cb);
-            diagonal = row[j + 1];
-            row[j + 1] = substitution.min(row[j] + 1).min(diagonal + 1);
-        }
-    }
-    row[b.len()]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn distances() {
-        assert_eq!(edit_distance("buffer", "buffer"), 0);
-        assert_eq!(edit_distance("bufer", "buffer"), 1);
-        assert_eq!(edit_distance("mesage", "message"), 1);
-        assert_eq!(edit_distance("", "abc"), 3);
-    }
-
-    #[test]
-    fn suggests_only_near_misses() {
-        let names = ["buffer".to_string(), "message".to_string()];
-        assert_eq!(closest("bufer", names.iter()), Some("buffer"));
-        assert_eq!(closest("printf", names.iter()), None);
     }
 }

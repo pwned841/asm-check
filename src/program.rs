@@ -39,12 +39,25 @@ pub enum SymbolKind {
     Constant,
 }
 
+/// The data definition a label names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDef {
+    /// `db`, `dq`, `resb`, ...
+    pub directive: String,
+    /// Bytes occupied, when known.
+    pub size: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct Symbol {
     pub span: Span,
     pub kind: SymbolKind,
     /// For code labels, the instruction the label points at.
     pub insn: Option<usize>,
+    /// The section the symbol is defined in, e.g. `.rodata`.
+    pub section: String,
+    /// For data labels, what is defined there.
+    pub data: Option<DataDef>,
 }
 
 /// A straight-line sequence of instructions, entered only at the top.
@@ -138,6 +151,12 @@ pub struct Program<'a> {
     /// The file uses macros, includes or structures, so the symbol table
     /// built here may be incomplete.
     pub opaque: bool,
+    /// Every `section` directive: its name and where it is.
+    pub sections: Vec<(String, Span)>,
+    /// Instructions found in a data section: their span and the section.
+    pub stray_code: Vec<(Span, String)>,
+    /// Initialised data found in `.bss`.
+    pub bss_data: Vec<Span>,
 }
 
 impl<'a> Program<'a> {
@@ -155,6 +174,9 @@ impl<'a> Program<'a> {
             references: HashMap::new(),
             bits: 64,
             opaque: false,
+            sections: Vec::new(),
+            stray_code: Vec::new(),
+            bss_data: Vec::new(),
         };
         program.collect();
         program.split_blocks();
@@ -218,6 +240,9 @@ impl<'a> Program<'a> {
 
     fn collect(&mut self) {
         let mut in_text = true;
+        let mut section = String::from(".text");
+        // A label alone on its line, waiting for the statement it names.
+        let mut bare: Option<String> = None;
         let mut run = 0;
         let mut break_run = false;
         let mut pending: Vec<String> = Vec::new();
@@ -234,20 +259,36 @@ impl<'a> Program<'a> {
                 if let Some(first) = self.symbols.get(&label.name) {
                     self.duplicates.push((label.name.clone(), label.span, first.span.line));
                 } else {
-                    let symbol = Symbol { span: label.span, kind, insn: None };
+                    let symbol = Symbol {
+                        span: label.span,
+                        kind,
+                        insn: None,
+                        section: section.clone(),
+                        data: None,
+                    };
                     self.symbols.insert(label.name.clone(), symbol);
                     if kind == SymbolKind::Code {
                         pending.push(label.name.clone());
                     }
+                    bare = Some(label.name.clone());
                 }
             }
             let Some(stmt) = stmt else { continue };
+            // `msg:` on one line and `db ...` on the next still name data.
+            if let (StmtKind::Data { directive, size, .. }, Some(name)) = (&stmt.kind, bare.take())
+                && let Some(symbol) = self.symbols.get_mut(&name)
+            {
+                symbol.kind = SymbolKind::Data;
+                symbol.data = Some(DataDef { directive: directive.clone(), size: *size });
+                pending.retain(|pending| *pending != name);
+            }
             match &stmt.kind {
                 StmtKind::Instruction(ins) => {
                     for symbol in ins.operands.iter().flat_map(|operand| operand.symbols()) {
                         *self.references.entry(symbol.clone()).or_default() += 1;
                     }
                     if !in_text {
+                        self.stray_code.push((stmt.span, section.clone()));
                         continue;
                     }
                     if std::mem::take(&mut break_run) {
@@ -269,22 +310,27 @@ impl<'a> Program<'a> {
                         block: 0,
                     });
                 }
-                StmtKind::Data { symbols } => {
+                StmtKind::Data { symbols, directive, .. } => {
                     for symbol in symbols {
                         *self.references.entry(symbol.clone()).or_default() += 1;
+                    }
+                    if section.starts_with(".bss") && !directive.starts_with("res") {
+                        self.bss_data.push(stmt.span);
                     }
                     if in_text {
                         break_run = true;
                         pending.clear();
                     }
                 }
-                StmtKind::Equ { symbols } => {
+                StmtKind::Equ { symbols, .. } => {
                     for symbol in symbols {
                         *self.references.entry(symbol.clone()).or_default() += 1;
                     }
                 }
                 StmtKind::Directive(directive) => match directive {
                     Directive::Section(name) => {
+                        section = name.clone();
+                        self.sections.push((name.clone(), stmt.span));
                         in_text = !is_data_section(name);
                         break_run = true;
                         pending.clear();
@@ -601,6 +647,11 @@ msg db 'hi', 10
         let lines = parse(HELLO);
         let program = Program::build(&lines);
         assert_eq!(program.symbols["msg"].kind, SymbolKind::Data);
+        assert_eq!(program.symbols["msg"].section, ".data");
+        assert_eq!(
+            program.symbols["msg"].data,
+            Some(DataDef { directive: "db".into(), size: Some(3) })
+        );
         assert_eq!(program.symbols["again"].kind, SymbolKind::Code);
         assert_eq!(program.references["again"], 1);
         assert_eq!(program.callee(&Target::Label("print".into())), Callee::Local(1));

@@ -15,15 +15,22 @@ use std::str::FromStr;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeDescription, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DiagnosticTag, DidChangeConfigurationParams, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, Location,
-    NumberOrString, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+    CodeActionProviderCapability, CodeDescription, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, DiagnosticRelatedInformation, DiagnosticSeverity,
+    DiagnosticTag, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
+    GotoDefinitionParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InlayHint, InlayHintLabel, InlayHintParams, Location, MarkupContent,
+    MarkupKind, NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range, ReferenceParams,
+    RenameParams, ServerCapabilities, SymbolKind, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, Edit, Severity};
+use crate::ide::{CompletionKind, Document, SymbolClass};
 use crate::span::Span;
 use crate::{Config, check};
 
@@ -56,6 +63,16 @@ pub fn serve(connection: Connection) -> Result<()> {
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string()]),
+            ..CompletionOptions::default()
+        }),
         ..ServerCapabilities::default()
     };
     let params = connection.initialize(serde_json::to_value(capabilities)?)?;
@@ -107,31 +124,162 @@ struct Server {
 
 impl Server {
     fn request(&self, request: Request) -> Response {
-        match request.method.as_str() {
-            "textDocument/codeAction" => {
-                match serde_json::from_value::<CodeActionParams>(request.params) {
-                    Ok(params) => {
-                        let uri = &params.text_document.uri;
-                        let actions = self
-                            .documents
-                            .get(uri)
-                            .map(|text| code_actions(uri, text, &self.config, params.range))
-                            .unwrap_or_default();
-                        Response::new_ok(request.id, actions)
-                    }
-                    Err(error) => Response::new_err(
-                        request.id,
+        let Request { id, method, params } = request;
+        match method.as_str() {
+            "textDocument/codeAction" => answer(id, params, |p: CodeActionParams| {
+                let uri = &p.text_document.uri;
+                self.documents
+                    .get(uri)
+                    .map(|text| code_actions(uri, text, &self.config, p.range))
+                    .unwrap_or_default()
+            }),
+            "textDocument/hover" => answer(id, params, |p: HoverParams| {
+                let (uri, document, lines, line, column) =
+                    self.locate(&p.text_document_position_params)?;
+                let (span, markdown) = document.hover(line, column)?;
+                let _ = uri;
+                Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: Some(range(&lines, span)),
+                })
+            }),
+            "textDocument/definition" => answer(id, params, |p: GotoDefinitionParams| {
+                let (uri, document, lines, line, column) =
+                    self.locate(&p.text_document_position_params)?;
+                let span = document.definition(line, column)?;
+                Some(Location::new(uri, range(&lines, span)))
+            }),
+            "textDocument/references" => answer(id, params, |p: ReferenceParams| {
+                let Some((uri, document, lines, line, column)) =
+                    self.locate(&p.text_document_position)
+                else {
+                    return Vec::new();
+                };
+                document
+                    .references(line, column)
+                    .into_iter()
+                    .map(|span| Location::new(uri.clone(), range(&lines, span)))
+                    .collect()
+            }),
+            "textDocument/rename" => {
+                let edit = serde_json::from_value::<RenameParams>(params).ok().and_then(|p| {
+                    let (uri, document, lines, line, column) =
+                        self.locate(&p.text_document_position)?;
+                    let edits = document
+                        .rename(line, column, &p.new_name)?
+                        .into_iter()
+                        .map(|(span, text)| TextEdit::new(range(&lines, span), text))
+                        .collect();
+                    Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri, edits)])),
+                        ..WorkspaceEdit::default()
+                    })
+                });
+                match edit {
+                    Some(edit) => Response::new_ok(id, edit),
+                    None => Response::new_err(
+                        id,
                         ErrorCode::InvalidParams as i32,
-                        error.to_string(),
+                        "only labels can be renamed, to a valid label name".to_string(),
                     ),
                 }
             }
+            "textDocument/documentSymbol" => answer(id, params, |p: DocumentSymbolParams| {
+                let Some(text) = self.documents.get(&p.text_document.uri) else {
+                    return Vec::new();
+                };
+                let lines: Vec<&str> = text.lines().collect();
+                Document::new(text)
+                    .outline()
+                    .into_iter()
+                    .map(|entry| {
+                        let range = range(&lines, entry.span);
+                        #[allow(deprecated)] // the `deprecated` field has no default
+                        DocumentSymbol {
+                            name: entry.name,
+                            detail: None,
+                            kind: match entry.class {
+                                SymbolClass::Function => SymbolKind::FUNCTION,
+                                SymbolClass::Label => SymbolKind::KEY,
+                                SymbolClass::Data => SymbolKind::VARIABLE,
+                                SymbolClass::Constant => SymbolKind::CONSTANT,
+                            },
+                            tags: None,
+                            deprecated: None,
+                            range,
+                            selection_range: range,
+                            children: None,
+                        }
+                    })
+                    .collect()
+            }),
+            "textDocument/inlayHint" => answer(id, params, |p: InlayHintParams| {
+                let Some(text) = self.documents.get(&p.text_document.uri) else {
+                    return Vec::new();
+                };
+                let lines: Vec<&str> = text.lines().collect();
+                Document::new(text)
+                    .inlay_hints()
+                    .into_iter()
+                    .filter(|(line, ..)| {
+                        (p.range.start.line..=p.range.end.line).contains(&(*line as u32))
+                    })
+                    .map(|(line, column, label)| InlayHint {
+                        position: position(&lines, line, column),
+                        label: InlayHintLabel::String(label),
+                        kind: None,
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: None,
+                        data: None,
+                    })
+                    .collect()
+            }),
+            "textDocument/completion" => answer(id, params, |p: CompletionParams| {
+                let Some((_, document, _, line, column)) = self.locate(&p.text_document_position)
+                else {
+                    return Vec::new();
+                };
+                document
+                    .completions(line, column)
+                    .into_iter()
+                    .map(|item| CompletionItem {
+                        label: item.label,
+                        kind: Some(match item.kind {
+                            CompletionKind::Instruction => CompletionItemKind::FUNCTION,
+                            CompletionKind::Register => CompletionItemKind::VARIABLE,
+                            CompletionKind::Label => CompletionItemKind::REFERENCE,
+                            CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+                        }),
+                        detail: (!item.detail.is_empty()).then_some(item.detail),
+                        ..CompletionItem::default()
+                    })
+                    .collect()
+            }),
             method => Response::new_err(
-                request.id,
+                id,
                 ErrorCode::MethodNotFound as i32,
                 format!("unsupported request `{method}`"),
             ),
         }
+    }
+
+    /// Resolves a cursor position: the document, its lines, and the cursor
+    /// as a line and a byte column.
+    fn locate(
+        &self,
+        at: &TextDocumentPositionParams,
+    ) -> Option<(Uri, Document, Vec<&str>, usize, usize)> {
+        let uri = at.text_document.uri.clone();
+        let text = self.documents.get(&uri)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let line = at.position.line as usize;
+        let column = byte_column(lines.get(line).copied().unwrap_or(""), at.position.character);
+        Some((uri, Document::new(text), lines, line, column))
     }
 
     /// Handles a notification and returns the notifications to send back.
@@ -193,6 +341,30 @@ impl Server {
         let params = PublishDiagnosticsParams { uri: uri.clone(), diagnostics, version: None };
         Notification::new("textDocument/publishDiagnostics".to_string(), params)
     }
+}
+
+/// Decodes the parameters, runs the handler and wraps its result.
+fn answer<P: DeserializeOwned, R: Serialize>(
+    id: lsp_server::RequestId,
+    params: Value,
+    handler: impl FnOnce(P) -> R,
+) -> Response {
+    match serde_json::from_value(params) {
+        Ok(params) => Response::new_ok(id, handler(params)),
+        Err(error) => Response::new_err(id, ErrorCode::InvalidParams as i32, error.to_string()),
+    }
+}
+
+/// The byte offset of a UTF-16 column in a line.
+fn byte_column(line: &str, character: u32) -> usize {
+    let mut units = 0;
+    for (offset, c) in line.char_indices() {
+        if units >= character {
+            return offset;
+        }
+        units += c.len_utf16() as u32;
+    }
+    line.len()
 }
 
 /// LSP positions count UTF-16 code units; spans count bytes.
@@ -314,6 +486,15 @@ mod tests {
     }
 
     #[test]
+    fn byte_columns() {
+        let line = "msg db 'é𝄞' ; x";
+        assert_eq!(byte_column(line, 8), 8);
+        assert_eq!(byte_column(line, 9), 10);
+        assert_eq!(byte_column(line, 11), 14);
+        assert_eq!(byte_column(line, 999), line.len());
+    }
+
+    #[test]
     fn positions_are_utf16() {
         // 'é' is 2 bytes but 1 UTF-16 unit; '𝄞' is 4 bytes and 2 units.
         let lines = ["msg db 'é𝄞' ; x"];
@@ -429,7 +610,51 @@ mod tests {
         notify("workspace/didChangeConfiguration", json!({"settings": {"allow": []}}));
         assert_eq!(diagnostics().len(), 1); // unused-label is back
 
-        request(2, "textDocument/hover", json!({}));
+        let at = |line: u32, character: u32| {
+            json!({"textDocument": {"uri": "file:///tmp/test.s"},
+                "position": {"line": line, "character": character}})
+        };
+        notify(
+            "textDocument/didChange",
+            json!({"textDocument": {"uri": "file:///tmp/test.s", "version": 3},
+                "contentChanges": [{"text": "f:\n    mov eax, 60\n    syscall\n    jmp f\n"}]}),
+        );
+        diagnostics();
+        request(10, "textDocument/hover", at(1, 5));
+        let hover = response().response_result.unwrap();
+        assert!(hover["contents"]["value"].as_str().unwrap().starts_with("**mov**"));
+        request(11, "textDocument/definition", at(3, 8));
+        assert_eq!(response().response_result.unwrap()["range"]["start"]["line"], json!(0));
+        request(12, "textDocument/references", {
+            let mut params = at(3, 8);
+            params["context"] = json!({"includeDeclaration": true});
+            params
+        });
+        assert_eq!(response().response_result.unwrap().as_array().unwrap().len(), 2);
+        request(
+            13,
+            "textDocument/inlayHint",
+            json!({"textDocument": {"uri": "file:///tmp/test.s"},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}}),
+        );
+        assert_eq!(response().response_result.unwrap()[0]["label"], json!("exit(status)"));
+        request(
+            14,
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": "file:///tmp/test.s"}}),
+        );
+        assert_eq!(response().response_result.unwrap()[0]["name"], json!("f"));
+        request(15, "textDocument/rename", {
+            let mut params = at(3, 8);
+            params["newName"] = json!("start");
+            params
+        });
+        let edit = response().response_result.unwrap();
+        assert_eq!(edit["changes"]["file:///tmp/test.s"].as_array().unwrap().len(), 2);
+        request(16, "textDocument/completion", at(3, 8));
+        assert!(response().response_result.unwrap().as_array().unwrap().len() > 60);
+
+        request(2, "textDocument/foldingRange", json!({}));
         assert_eq!(response().response_result.unwrap_err().code, ErrorCode::MethodNotFound as i32);
 
         notify("textDocument/didClose", json!({"textDocument": {"uri": "file:///tmp/test.s"}}));

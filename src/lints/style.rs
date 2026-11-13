@@ -34,7 +34,7 @@ pub static NOOP_ARITHMETIC: Lint = Lint {
 pub static NEEDLESS_REX: Lint = Lint {
     name: "needless-rex",
     group: Group::Pedantic,
-    summary: "a 64-bit operand where the 32-bit form has the same effect and is shorter",
+    summary: "`xor r64, r64`, which the 32-bit form does in one byte less",
 };
 
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
@@ -73,30 +73,6 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                             replacement,
                         ),
                     );
-                }
-            }
-            "mov" if dest.width == Width::W64 => {
-                if let Some(value) = constant
-                    && (1..=i64::from(u32::MAX)).contains(&value)
-                {
-                    out.push(
-                        Diagnostic::new(
-                            &NEEDLESS_REX,
-                            first.span,
-                            format!(
-                                "`mov {small}, {}` does the same in fewer bytes",
-                                cx.text(second.span)
-                            ),
-                        )
-                        .note("writing a 32-bit register clears the upper half of the 64-bit one")
-                        .replace(
-                            format!("use `{small}`"),
-                            first.span,
-                            small,
-                        ),
-                    );
-                } else if same_register {
-                    out.push(self_move(cx, index));
                 }
             }
             "mov" if same_register && dest.width != Width::W32 => out.push(self_move(cx, index)),

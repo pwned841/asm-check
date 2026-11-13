@@ -94,18 +94,25 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         && (writes || compares)
     {
         let text = cx.text(dest.span);
-        let message = if writes {
-            format!("`{mnemonic}` cannot write to `{text}`: it is a value, not a location")
+        let mut diagnostic = if writes {
+            Diagnostic::new(&INVALID_OPERANDS, dest.span, format!("cannot write to `{text}`"))
         } else {
-            format!("the first operand of `{mnemonic}` cannot be an immediate")
+            Diagnostic::new(
+                &INVALID_OPERANDS,
+                dest.span,
+                format!("the first operand of `{mnemonic}` cannot be an immediate"),
+            )
         };
-        let mut diagnostic = Diagnostic::new(&INVALID_OPERANDS, dest.span, message);
         if !dest.symbols().is_empty() {
+            // A label is an address. The memory it names is `[label]`.
             diagnostic = diagnostic
-                .help(format!("to access the memory at `{text}`, write `[{text}]`"))
-                .replace("wrap in brackets", dest.span, format!("[{text}]"));
+                .label("an address, not a memory location")
+                .replace(format!("access the memory: `[{text}]`"), dest.span, format!("[{text}]"))
+                .maybe_incorrect();
         } else if compares {
-            diagnostic = diagnostic.help("swap the operands");
+            diagnostic = diagnostic.label("a constant").help("swap the operands");
+        } else {
+            diagnostic = diagnostic.label("a constant cannot be a destination");
         }
         out.push(diagnostic);
         return true;
@@ -116,10 +123,13 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         && b.is_mem()
         && (BINARY.contains(&mnemonic) || EXTENDS.contains(&mnemonic))
     {
-        let message = format!("`{mnemonic}` cannot take two memory operands");
         out.push(
-            Diagnostic::new(&INVALID_OPERANDS, insn.span, message)
-                .help("go through a register: load one operand first, then use it"),
+            Diagnostic::new(
+                &INVALID_OPERANDS,
+                insn.span,
+                format!("`{mnemonic}` cannot take two memory operands"),
+            )
+            .help("go through a register: load one operand first"),
         );
         return true;
     }
@@ -129,10 +139,11 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         && !source.is_mem()
     {
         let text = cx.text(source.span);
-        let message = "`lea` computes an address: its source must be a memory operand";
         out.push(
-            Diagnostic::new(&INVALID_OPERANDS, source.span, message)
-                .help(format!("write `[{text}]`, or use `mov` to copy a value")),
+            Diagnostic::new(&INVALID_OPERANDS, source.span, "`lea` needs a memory operand")
+                .label("not an address expression")
+                .replace(format!("write `[{text}]`"), source.span, format!("[{text}]"))
+                .maybe_incorrect(),
         );
         return true;
     }
@@ -143,15 +154,17 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         && let Some(operand) = first
     {
         let wide = reg.id.name64();
-        let message = format!("`{mnemonic} {reg}` cannot be encoded in 64-bit mode");
         out.push(
-            Diagnostic::new(&INVALID_OPERANDS, operand.span, message)
-                .help(format!("the stack holds 64-bit values: use `{mnemonic} {wide}`"))
-                .replace(format!("use `{wide}`"), operand.span, wide),
+            Diagnostic::new(
+                &INVALID_OPERANDS,
+                operand.span,
+                format!("`{mnemonic} {reg}` does not exist in 64-bit mode"),
+            )
+            .label("stack slots are 64-bit")
+            .replace(format!("use `{wide}`"), operand.span, wide),
         );
         return true;
     }
-
     false
 }
 
@@ -165,11 +178,16 @@ fn sizes(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
         && let Some(count) = b.as_reg()
         && count != Reg::new(RegId::RCX, Width::Low8)
     {
-        let message = format!("a shift count must be `cl` or an immediate, not `{count}`");
-        out.push(
-            Diagnostic::new(&OPERAND_SIZE_MISMATCH, b.span, message)
-                .help("move the count into `rcx` and shift by `cl`"),
-        );
+        let mut diagnostic = Diagnostic::new(
+            &OPERAND_SIZE_MISMATCH,
+            b.span,
+            format!("`{mnemonic}` cannot shift by `{count}`"),
+        )
+        .label("the count must be `cl` or a constant");
+        if count.id == RegId::RCX {
+            diagnostic = diagnostic.replace("use `cl`", b.span, "cl");
+        }
+        out.push(diagnostic);
         return;
     }
 
@@ -180,43 +198,45 @@ fn sizes(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
 
     // `movzx`/`movsx` only take an 8- or 16-bit source.
     if EXTENDS.contains(&mnemonic) && (y >= x || y > 16) {
-        let message = if y >= x {
-            format!(
-                "`{mnemonic}` widens its source, but `{b_text}` ({y}-bit) is not smaller than \
-                 `{a_text}` ({x}-bit)"
-            )
-        } else {
-            format!("`{mnemonic}` takes an 8- or 16-bit source, but `{b_text}` is {y}-bit")
-        };
-        let mut diagnostic = Diagnostic::new(&OPERAND_SIZE_MISMATCH, insn.span, message);
+        let mut diagnostic = Diagnostic::new(
+            &OPERAND_SIZE_MISMATCH,
+            insn.span,
+            format!("`{mnemonic}` cannot widen {y} bits to {x}"),
+        )
+        .label("the source must be 8 or 16 bits, and smaller than the destination");
         if let (32, 64, Some(dest)) = (y, x, a.as_reg()) {
-            diagnostic = diagnostic.help(if mnemonic == "movzx" {
-                format!("`mov {}, {b_text}` already clears the upper 32 bits", dest.id.name32())
+            let replacement = if mnemonic == "movzx" {
+                format!("mov {}, {b_text}", dest.id.name32())
             } else {
-                format!("use `movsxd {a_text}, {b_text}` to sign-extend 32 bits to 64")
-            });
+                format!("movsxd {a_text}, {b_text}")
+            };
+            diagnostic = diagnostic.replace(format!("use `{replacement}`"), insn.span, replacement);
         }
         out.push(diagnostic);
         return;
     }
 
     if (BINARY.contains(&mnemonic) || cmov) && x != y {
-        let message = format!("`{a_text}` is {x}-bit but `{b_text}` is {y}-bit");
-        let help = match (mnemonic, a.as_reg(), b.as_reg()) {
-            ("mov", Some(dest), Some(_)) if y == 32 && x == 64 => format!(
-                "`mov {}, {b_text}` zero-extends into `{a_text}`; use `movsxd` to sign-extend",
-                dest.id.name32()
-            ),
-            ("mov", Some(_), _) if y < x => {
-                format!("use `movzx {a_text}, {b_text}` to zero-extend, or `movsx` to sign-extend")
+        let mut diagnostic = Diagnostic::new(
+            &OPERAND_SIZE_MISMATCH,
+            insn.span,
+            format!("`{a_text}` is {x}-bit but `{b_text}` is {y}-bit"),
+        );
+        // Between two registers, the narrower one decides: shrink the other.
+        diagnostic = match (a.as_reg(), b.as_reg()) {
+            (Some(dest), Some(source)) => {
+                let (operand, wide, bits) =
+                    if x > y { (a, dest, source.width) } else { (b, source, dest.width) };
+                match wide.id.name(bits) {
+                    Some(part) => diagnostic
+                        .replace(format!("use `{part}`"), operand.span, part)
+                        .maybe_incorrect(),
+                    None => diagnostic.help("both operands must have the same size"),
+                }
             }
-            (_, Some(dest), Some(source)) if x < y => match source.id.name(dest.width) {
-                Some(part) => format!("use `{part}`, the {x}-bit part of `{b_text}`"),
-                None => "both operands must have the same size".to_string(),
-            },
-            _ => "both operands must have the same size".to_string(),
+            _ => diagnostic.help("both operands must have the same size"),
         };
-        out.push(Diagnostic::new(&OPERAND_SIZE_MISMATCH, insn.span, message).help(help));
+        out.push(diagnostic);
     }
 }
 
@@ -232,11 +252,37 @@ fn ambiguous(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
         || SHIFTS.contains(&mnemonic)
         || UNARY.contains(&mnemonic)
         || (matches!(mnemonic, "mul" | "div" | "idiv" | "imul") && operands.len() == 1);
-    if undetermined {
-        let text = cx.text(target.span);
-        let message = format!("the size of `{text}` is ambiguous: it could be 1, 2, 4 or 8 bytes");
-        out.push(Diagnostic::new(&AMBIGUOUS_OPERAND_SIZE, target.span, message).help(format!(
-            "state it: `byte {text}`, `word {text}`, `dword {text}` or `qword {text}`"
-        )));
+    if !undetermined {
+        return;
     }
+    let text = cx.text(target.span);
+    let diagnostic = Diagnostic::new(
+        &AMBIGUOUS_OPERAND_SIZE,
+        target.span,
+        format!("the size of `{text}` is not specified"),
+    )
+    .label("1, 2, 4 or 8 bytes?");
+    // The declaration of the variable says what was meant.
+    let declared = target
+        .symbols()
+        .first()
+        .and_then(|name| cx.program.symbols.get(name))
+        .and_then(|symbol| symbol.data.as_ref())
+        .and_then(|data| match data.directive.as_str() {
+            "db" | "resb" => Some("byte"),
+            "dw" | "resw" => Some("word"),
+            "dd" | "resd" => Some("dword"),
+            "dq" | "resq" => Some("qword"),
+            _ => None,
+        });
+    out.push(match declared {
+        Some(size) => diagnostic
+            .replace(
+                format!("it is declared as `{size}`"),
+                crate::span::Span::new(target.span.line, target.span.start, target.span.start),
+                format!("{size} "),
+            )
+            .maybe_incorrect(),
+        None => diagnostic.help(format!("prefix it: `byte {text}`, `word`, `dword` or `qword`")),
+    });
 }

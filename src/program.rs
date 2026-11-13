@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::abi;
-use crate::ast::{Directive, Instruction, Line, StmtKind};
+use crate::ast::{Directive, Instruction, Line, OperandKind, StmtKind};
 use crate::insn::{Effects, Flow, Target, effects};
 use crate::reg::{RegId, RegSet, Width};
 use crate::span::Span;
@@ -44,8 +44,20 @@ pub enum SymbolKind {
 pub struct DataDef {
     /// `db`, `dq`, `resb`, ...
     pub directive: String,
-    /// Bytes occupied, when known.
+    /// Bytes occupied, when known. Continuation lines are included.
     pub size: Option<u64>,
+    /// The definition ends with a zero byte.
+    pub nul_terminated: bool,
+    /// The end of the definition, where another value could be appended.
+    pub end: Span,
+}
+
+/// What a register holds, as far as the instruction that set it tells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Constant(i64),
+    /// The address of a symbol: `mov rsi, msg` or `lea rsi, [rel msg]`.
+    Address(String),
 }
 
 #[derive(Debug)]
@@ -152,6 +164,8 @@ pub struct Program<'a> {
     /// The file uses macros, includes or structures, so the symbol table
     /// built here may be incomplete.
     pub opaque: bool,
+    /// The source lines, when the caller provided them: lints quote them.
+    pub text: Vec<&'a str>,
     /// The file says `default rel`.
     pub default_rel: bool,
     /// Every `section` directive: its name and where it is.
@@ -178,6 +192,7 @@ impl<'a> Program<'a> {
             references: HashMap::new(),
             bits: 64,
             opaque: false,
+            text: Vec::new(),
             default_rel: false,
             sections: Vec::new(),
             stray_code: Vec::new(),
@@ -226,6 +241,38 @@ impl<'a> Program<'a> {
         }
     }
 
+    /// What `reg` holds just before the instruction at `index`, when the
+    /// instruction that set it makes it obvious.
+    pub fn value_before(&self, index: usize, reg: RegId) -> Option<Value> {
+        let write = &self.insns[self.last_write_before(index, reg)?];
+        if write.fx.zeroing {
+            return Some(Value::Constant(0));
+        }
+        let source = write.ins.operands.get(1)?;
+        let full = write.fx.full_writes.contains(reg);
+        match (write.ins.mnemonic.as_str(), &source.kind) {
+            ("mov", OperandKind::Imm(expr)) if full => {
+                match (expr.value, expr.symbols.as_slice()) {
+                    (Some(value), _) => Some(Value::Constant(value)),
+                    (None, [name]) if self.is_plain(source, name) => {
+                        Some(Value::Address(name.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            ("lea", OperandKind::Mem(mem)) if mem.direct => {
+                Some(Value::Address(mem.symbols[0].clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether an operand is the bare symbol, with no arithmetic on it.
+    fn is_plain(&self, operand: &crate::ast::Operand, name: &str) -> bool {
+        let text = self.snippet(operand.span);
+        text.is_empty() || name.ends_with(text.trim())
+    }
+
     /// The instruction that last wrote `reg` before the one at `index`,
     /// when it is in the same straight-line sequence: no label, jump, call
     /// or unknown instruction in between.
@@ -246,6 +293,16 @@ impl<'a> Program<'a> {
         }
     }
 
+    /// The source text a span covers, or nothing when it is not available.
+    pub fn snippet(&self, span: Span) -> &str {
+        self.text.get(span.line).and_then(|line| line.get(span.start..span.end)).unwrap_or("")
+    }
+
+    /// The index of the instruction on a source line.
+    pub fn at_line(&self, line: usize) -> Option<usize> {
+        self.insns.iter().position(|insn| insn.line == line)
+    }
+
     /// The functions that contain `block`.
     pub fn functions_of(&self, block: usize) -> impl Iterator<Item = &Function> {
         self.functions.iter().filter(move |function| function.blocks.binary_search(&block).is_ok())
@@ -256,6 +313,8 @@ impl<'a> Program<'a> {
         let mut section = String::from(".text");
         // A label alone on its line, waiting for the statement it names.
         let mut bare: Option<String> = None;
+        // The data label that unlabelled `db` lines continue.
+        let mut continued: Option<String> = None;
         let mut run = 0;
         let mut break_run = false;
         let mut pending: Vec<String> = Vec::new();
@@ -288,12 +347,34 @@ impl<'a> Program<'a> {
             }
             let Some(stmt) = stmt else { continue };
             // `msg:` on one line and `db ...` on the next still name data.
-            if let (StmtKind::Data { directive, size, .. }, Some(name)) = (&stmt.kind, bare.take())
-                && let Some(symbol) = self.symbols.get_mut(&name)
-            {
-                symbol.kind = SymbolKind::Data;
-                symbol.data = Some(DataDef { directive: directive.clone(), size: *size });
-                pending.retain(|pending| *pending != name);
+            let end = Span::new(stmt.span.line, stmt.span.end, stmt.span.end);
+            match (&stmt.kind, bare.take()) {
+                (StmtKind::Data { directive, size, terminated, .. }, Some(name)) => {
+                    if let Some(symbol) = self.symbols.get_mut(&name) {
+                        symbol.kind = SymbolKind::Data;
+                        symbol.data = Some(DataDef {
+                            directive: directive.clone(),
+                            size: *size,
+                            nul_terminated: *terminated,
+                            end,
+                        });
+                        pending.retain(|pending| *pending != name);
+                    }
+                    continued = Some(name);
+                }
+                // An unlabelled data line extends the definition above it.
+                (StmtKind::Data { size, terminated, .. }, None) => {
+                    if let Some(data) = continued
+                        .as_ref()
+                        .and_then(|name| self.symbols.get_mut(name))
+                        .and_then(|symbol| symbol.data.as_mut())
+                    {
+                        data.size = data.size.zip(*size).map(|(a, b)| a + b);
+                        data.nul_terminated = *terminated;
+                        data.end = end;
+                    }
+                }
+                _ => continued = None,
             }
             match &stmt.kind {
                 StmtKind::Instruction(ins) => {
@@ -668,7 +749,12 @@ msg db 'hi', 10
         assert_eq!(program.symbols["msg"].section, ".data");
         assert_eq!(
             program.symbols["msg"].data,
-            Some(DataDef { directive: "db".into(), size: Some(3) })
+            Some(DataDef {
+                directive: "db".into(),
+                size: Some(3),
+                nul_terminated: false,
+                end: Span::new(24, 15, 15),
+            })
         );
         assert_eq!(program.symbols["again"].kind, SymbolKind::Code);
         assert_eq!(program.references["again"], 1);

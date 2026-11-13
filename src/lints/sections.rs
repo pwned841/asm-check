@@ -56,20 +56,18 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         }
         let name = program.sections.get(*section).map_or("a data section", |(name, _)| name);
         out.push(
-            Diagnostic::new(
-                &CODE_IN_DATA_SECTION,
-                *span,
-                format!("this instruction is in `{name}`, which is not executable"),
-            )
-            .help("put `section .text` before the code"),
+            Diagnostic::new(&CODE_IN_DATA_SECTION, *span, format!("code in `{name}`"))
+                .label("this section is not executable")
+                .insert_before("start a code section", span.line, "section .text")
+                .maybe_incorrect(),
         );
     }
 
     for span in &program.bss_data {
         out.push(
-            Diagnostic::new(&DATA_IN_BSS, *span, "`.bss` cannot hold initialised data")
-                .note("the section only reserves space: the assembler ignores these values")
-                .help("reserve space with `resb`, `resq`, ... or move the definition to `.data`"),
+            Diagnostic::new(&DATA_IN_BSS, *span, "initialised data in `.bss`")
+                .label("the value is ignored: `.bss` only reserves space")
+                .help("use `resb`/`resq` here, or move the definition to `.data`"),
         );
     }
 
@@ -82,16 +80,11 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             .into_iter()
             .find(|standard| *standard == dotted || text::typo_distance(standard, name) == 1);
         if let Some(intended) = intended {
+            let fixed = cx.text(*span).replacen(name.as_str(), intended, 1);
             out.push(
-                Diagnostic::new(
-                    &UNKNOWN_SECTION,
-                    *span,
-                    format!("`{name}` is not a standard section: did you mean `{intended}`?"),
-                )
-                .note(
-                    "an unknown name creates a new section with default attributes, \
-                     which is neither executable nor writable",
-                ),
+                Diagnostic::new(&UNKNOWN_SECTION, *span, format!("unknown section `{name}`"))
+                    .label("a new section, neither executable nor writable")
+                    .replace(format!("use `{intended}`"), *span, fixed),
             );
         }
     }
@@ -117,12 +110,11 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 Diagnostic::new(
                     &MISPLACED_LENGTH,
                     stmt.span,
-                    format!("`$ - {name}` also counts `{other}`, defined after `{name}`"),
+                    format!("`$ - {name}` also counts `{other}`"),
                 )
-                .note(
-                    "`$` is the current position: everything between it and the label is measured",
-                )
-                .help(format!("move this line right after the definition of `{name}`")),
+                .label("measures everything since the label")
+                .note_at(symbol.span, format!("`{name}` starts here"))
+                .help(format!("move this line right after `{name}`")),
             );
         }
     }
@@ -136,26 +128,31 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         };
         if program.symbols.get(name).is_some_and(|symbol| symbol.kind == SymbolKind::Data) {
             let target = insn.ins.operands.first().map_or(insn.span, |operand| operand.span);
-            out.push(
-                Diagnostic::new(
-                    &JUMP_TO_DATA,
-                    target,
-                    format!("`{}` to `{name}`, which is data, not code", insn.ins.mnemonic),
-                )
-                .note("the processor would execute the bytes of the data as instructions"),
-            );
+            let mut diagnostic = Diagnostic::new(
+                &JUMP_TO_DATA,
+                target,
+                format!("`{}` to data `{name}`", insn.ins.mnemonic),
+            )
+            .label("would execute these bytes as instructions");
+            if let Some(symbol) = program.symbols.get(name) {
+                diagnostic = diagnostic.note_at(symbol.span, "defined as data here");
+            }
+            out.push(diagnostic);
         }
     }
 
     if !program.opaque {
         for (name, span) in &program.externs {
-            if !program.references.contains_key(name) {
-                out.push(Diagnostic::new(
-                    &UNUSED_EXTERN,
-                    *span,
-                    format!("`{name}` is declared `extern` but never used"),
-                ));
+            if program.references.contains_key(name) {
+                continue;
             }
+            let mut diagnostic =
+                Diagnostic::new(&UNUSED_EXTERN, *span, format!("unused `extern {name}`"));
+            // Safe to drop the line when it declares nothing else.
+            if !cx.text(*span).contains(',') && program.lines[span.line].label.is_none() {
+                diagnostic = diagnostic.delete_line("remove the declaration", span.line);
+            }
+            out.push(diagnostic);
         }
     }
 }

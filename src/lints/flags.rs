@@ -2,7 +2,7 @@
 
 use super::Context;
 use crate::dataflow::{self, Analysis};
-use crate::diagnostic::{Diagnostic, Group, Lint};
+use crate::diagnostic::{Diagnostic, Edit, Group, Lint};
 use crate::insn::{Flags, Flow};
 use crate::program::{Function, Insn, Program};
 
@@ -50,20 +50,26 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         };
         let code = cx.code(insn);
         match insn.ins.mnemonic.as_str() {
-            "cmp" if a.as_reg().is_some() && a.as_reg() == b.as_reg() => out.push(
-                Diagnostic::new(
-                    &CONSTANT_COMPARISON,
-                    insn.span,
-                    format!("`{code}` compares a register with itself: always equal"),
-                )
-                .help(format!("to check for zero, use `test {0}, {0}`", cx.text(a.span))),
-            ),
+            "cmp" if a.as_reg().is_some() && a.as_reg() == b.as_reg() => {
+                let test = format!("test {0}, {0}", cx.text(a.span));
+                out.push(
+                    Diagnostic::new(
+                        &CONSTANT_COMPARISON,
+                        insn.span,
+                        format!("`{code}` is always equal"),
+                    )
+                    .label("a register compared with itself")
+                    .replace(format!("check for zero with `{test}`"), insn.span, test)
+                    .maybe_incorrect(),
+                );
+            }
             "test" if b.constant() == Some(0) => out.push(
                 Diagnostic::new(
                     &CONSTANT_COMPARISON,
                     insn.span,
-                    format!("`{code}` always gives zero: `test` ANDs its operands"),
+                    format!("`{code}` is always zero"),
                 )
+                .label("`test` ANDs its operands")
                 .help("test against the bits you care about, or the operand against itself"),
             ),
             _ => {}
@@ -127,46 +133,52 @@ fn finish(cx: &Context, comparison: Option<Comparison>, out: &mut Vec<Diagnostic
     }
     let program = cx.program;
     let (insn, by) = (&program.insns[comparison.index], &program.insns[overwriter]);
-    let mnemonic = &insn.ins.mnemonic;
-    out.push(
-        Diagnostic::new(
-            &UNUSED_COMPARISON,
-            insn.span,
-            format!("the result of this `{mnemonic}` is never used"),
-        )
-        .note_at(
-            by.span,
-            format!(
-                "`{}` on line {} overwrites the flags before anything tests them",
-                by.ins.mnemonic,
-                by.line + 1
-            ),
-        )
-        .help("remove it, or move it right before the jump that should test it"),
-    );
+    let mut diagnostic = Diagnostic::new(
+        &UNUSED_COMPARISON,
+        insn.span,
+        format!("this `{}` has no effect", insn.ins.mnemonic),
+    )
+    .label("nothing tests its result")
+    .note_at(by.span, format!("`{}` overwrites the flags first", by.ins.mnemonic));
+    if program.lines[insn.line].label.is_none() {
+        diagnostic = diagnostic.delete_line("remove it", insn.line).maybe_incorrect();
+    }
+    out.push(diagnostic);
 }
 
 fn clobbered(cx: &Context, reader: &Insn, comparison: usize, overwriter: usize) -> Diagnostic {
     let program = cx.program;
     let (cmp, by) = (&program.insns[comparison], &program.insns[overwriter]);
-    Diagnostic::new(
+    let (jump, test) = (&reader.ins.mnemonic, &cmp.ins.mnemonic);
+    let mut diagnostic = Diagnostic::new(
         &FLAGS_CLOBBERED,
         reader.span,
-        format!(
-            "`{}` tests the flags of `{}` (line {}), not those of the `{}` on line {}",
-            reader.ins.mnemonic,
-            by.ins.mnemonic,
-            by.line + 1,
-            cmp.ins.mnemonic,
-            cmp.line + 1
-        ),
+        format!("`{jump}` tests `{}`, not the `{test}`", by.ins.mnemonic),
     )
-    .note_at(by.span, format!("`{}` overwrites the flags here", cx.code(by)))
-    .help(format!(
-        "move the `{}` right before `{}`; `mov` and `lea` can sit in between, they leave \
-         the flags alone",
-        cmp.ins.mnemonic, reader.ins.mnemonic
-    ))
+    .label("reads the flags of the instruction above")
+    .note_at(cmp.span, "this result is lost")
+    .note_at(by.span, "overwrites the flags");
+
+    // Moving the comparison down is safe when nothing in between changes
+    // what it compares.
+    let reader_index = program.at_line(reader.line).unwrap_or(comparison);
+    let between = &program.insns[comparison + 1..reader_index.max(comparison + 1)];
+    let stable = cmp.ins.operands.iter().all(|operand| !operand.is_mem())
+        && between
+            .iter()
+            .all(|insn| insn.fx.known && insn.fx.writes.intersection(cmp.fx.reads).is_empty());
+    if stable && program.lines[cmp.line].label.is_none() {
+        diagnostic = diagnostic
+            .fix(
+                format!("move the `{test}` next to `{jump}`"),
+                vec![
+                    Edit::DeleteLine(cmp.line),
+                    Edit::InsertBefore { line: reader.line, text: cx.code(cmp).to_string() },
+                ],
+            )
+            .maybe_incorrect();
+    }
+    diagnostic
 }
 
 // --- undefined-flags -------------------------------------------------------
@@ -232,24 +244,34 @@ impl Analysis for FlagsSet {
 fn undefined(program: &Program, index: usize, why: Unset) -> Diagnostic {
     let insn = &program.insns[index];
     let mnemonic = &insn.ins.mnemonic;
-    let since = match why {
-        Unset::Entry => "the program started".to_string(),
-        Unset::Call(line) => format!("the call on line {}", line + 1),
-    };
     let mut diagnostic = Diagnostic::new(
         &UNDEFINED_FLAGS,
         insn.span,
-        format!("`{mnemonic}` tests the flags, but nothing has set them since {since}"),
-    );
-    // The usual cause: expecting a data move to set the zero flag.
+        format!("`{mnemonic}` tests flags that nothing set"),
+    )
+    .label("no `cmp`, `test` or arithmetic before it");
+    if let Unset::Call(line) = why
+        && let Some(call) = program.at_line(line)
+    {
+        diagnostic =
+            diagnostic.note_at(program.insns[call].span, "a call leaves the flags undefined");
+    }
+    // The usual cause: expecting a data move to set the zero flag. Then
+    // the value just moved is what was meant to be tested.
     let block = &program.blocks[insn.block];
     if index > block.start {
-        let previous = &program.insns[index - 1].ins.mnemonic;
-        if matches!(
-            previous.as_str(),
-            "mov" | "movzx" | "movsx" | "lea" | "pop" | "push" | "xchg" | "not"
-        ) {
-            diagnostic = diagnostic.note(format!("`{previous}` does not change the flags"));
+        let previous = &program.insns[index - 1];
+        let moved =
+            matches!(previous.ins.mnemonic.as_str(), "mov" | "movzx" | "movsx" | "lea" | "pop");
+        if let (true, Some(dest)) = (moved, previous.fx.dest) {
+            let test = format!("test {dest}, {dest}");
+            return diagnostic
+                .note_at(
+                    previous.span,
+                    format!("`{}` does not change the flags", previous.ins.mnemonic),
+                )
+                .insert_before(format!("test `{dest}` first"), insn.line, test)
+                .maybe_incorrect();
         }
     }
     diagnostic.help(format!("put a `cmp` or a `test` right before `{mnemonic}`"))

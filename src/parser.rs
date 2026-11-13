@@ -98,6 +98,7 @@ fn parse_statement(number: usize, code: &str, start: usize, parent: &str) -> Opt
     let kind = if is_data_directive(&head) {
         StmtKind::Data {
             size: data_size(&head, rest),
+            terminated: ends_with_zero(rest),
             directive: head,
             symbols: symbols_in(rest, parent),
         }
@@ -130,7 +131,8 @@ fn parse_times(number: usize, code: &str, start: usize, end: usize, parent: &str
                 .zip(each)
                 .and_then(|(count, each)| count.checked_mul(each));
             let symbols = symbols_in(&code[start..end], parent);
-            return StmtKind::Data { directive: word, symbols, size };
+            let terminated = ends_with_zero(&code[word_end..end]);
+            return StmtKind::Data { directive: word, symbols, size, terminated };
         }
         if is_known_mnemonic(&word) || is_prefix(&word) {
             let prefix = Some("times".to_string());
@@ -141,7 +143,15 @@ fn parse_times(number: usize, code: &str, start: usize, end: usize, parent: &str
         directive: "times".to_string(),
         symbols: symbols_in(&code[start..end], parent),
         size: None,
+        terminated: false,
     }
+}
+
+/// Whether the last value of a data definition is the constant zero.
+fn ends_with_zero(operands: &str) -> bool {
+    split_operands(operands, 0, operands.len())
+        .last()
+        .is_some_and(|(start, end)| evaluate(&tokenize(&operands[*start..*end])) == Some(0))
 }
 
 /// Bytes occupied by a data directive, when its operands determine it.

@@ -111,3 +111,13 @@ fn other_modes_are_left_alone() {
     let source = "bits 32\n_start:\n    push eax\n    int 0x80\n";
     assert!(check(source, &Config::default()).is_empty());
 }
+
+#[test]
+fn every_lint_is_documented() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/lints.md");
+    let docs = fs::read_to_string(path).unwrap();
+    let documented: BTreeSet<&str> =
+        docs.lines().filter_map(|line| line.strip_prefix("### ")).collect();
+    let existing: BTreeSet<&str> = lints::ALL.iter().map(|lint| lint.name).collect();
+    assert_eq!(documented, existing, "docs/lints.md and the lint list disagree");
+}

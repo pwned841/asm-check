@@ -80,3 +80,34 @@ fn lint_names_are_unique_and_kebab_case() {
         );
     }
 }
+
+/// Whatever the input, the tool must answer rather than crash: an editor
+/// runs it on every keystroke, on half-typed lines.
+#[test]
+fn never_panics_on_truncated_or_mangled_input() {
+    let config = Config { pedantic: true, ..Config::default() };
+    for path in sources("fixtures").into_iter().chain(sources("clean")) {
+        let source = fs::read_to_string(&path).unwrap();
+        for end in (0..source.len()).filter(|end| source.is_char_boundary(*end)) {
+            check(&source[..end], &config);
+        }
+        // Drop each character class in turn to break the syntax in new ways.
+        for removed in [' ', ',', ':', '[', ']', '\n', '.'] {
+            check(&source.replace(removed, ""), &config);
+        }
+    }
+}
+
+#[test]
+fn gnu_syntax_is_left_alone() {
+    let att = ".globl _start\n_start:\n    movq $60, %rax\n    syscall\n";
+    assert!(asm_check::is_gnu_syntax(att));
+    assert!(check(att, &Config::default()).is_empty());
+    assert!(!asm_check::is_gnu_syntax("global _start\n_start:\n    mov rax, 10 % 3\n"));
+}
+
+#[test]
+fn other_modes_are_left_alone() {
+    let source = "bits 32\n_start:\n    push eax\n    int 0x80\n";
+    assert!(check(source, &Config::default()).is_empty());
+}

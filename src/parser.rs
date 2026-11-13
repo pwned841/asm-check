@@ -444,8 +444,7 @@ fn split_operands(code: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
         }
     };
     let (mut quote, mut depth, mut from) = (None, 0i32, start);
-    for i in start..end {
-        let b = bytes[i];
+    for (i, &b) in bytes.iter().enumerate().take(end).skip(start) {
         match quote {
             Some(q) if b == q => quote = None,
             Some(_) => {}

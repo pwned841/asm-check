@@ -30,6 +30,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, Edit, Severity};
+use crate::fix::{self, DiffLine};
 use crate::ide::{CompletionKind, Document, SymbolClass};
 use crate::span::Span;
 use crate::{Config, check};
@@ -380,13 +381,35 @@ fn range(lines: &[&str], span: Span) -> Range {
 
 fn to_lsp(uri: &Uri, lines: &[&str], diagnostic: &Diagnostic) -> lsp_types::Diagnostic {
     let name = diagnostic.lint.name;
-    // Editors show the message only, so fold the notes and the help into it.
+    // Editors show one message per diagnostic: keep it to the headline and
+    // the fix, as a diff, which Markdown-aware editors colour.
     let mut message = diagnostic.message.clone();
-    for note in &diagnostic.notes {
-        message.push_str(&format!("\nnote: {}", note.message));
-    }
-    if let Some(help) = &diagnostic.help {
-        message.push_str(&format!("\nhelp: {help}"));
+    match (&diagnostic.fix, &diagnostic.help) {
+        (Some(fix), _) => {
+            let rows = fix::preview(fix, lines);
+            let texts = rows.iter().map(|row| match row {
+                DiffLine::Context { text, .. }
+                | DiffLine::Removed { text, .. }
+                | DiffLine::Added { text, .. } => text.as_str(),
+            });
+            let margin = texts
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| text.len() - text.trim_start().len())
+                .min()
+                .unwrap_or(0);
+            message.push_str("\n```diff\n");
+            for row in &rows {
+                let (sign, text) = match row {
+                    DiffLine::Context { text, .. } => (' ', text),
+                    DiffLine::Removed { text, .. } => ('-', text),
+                    DiffLine::Added { text, .. } => ('+', text),
+                };
+                message.push_str(&format!("{sign} {}\n", text.get(margin..).unwrap_or(text)));
+            }
+            message.push_str("```");
+        }
+        (None, Some(help)) => message.push_str(&format!("\nhelp: {help}")),
+        (None, None) => {}
     }
     let related: Vec<DiagnosticRelatedInformation> = diagnostic
         .notes
@@ -428,13 +451,13 @@ fn code_actions(
 ) -> Vec<CodeActionOrCommand> {
     let lines: Vec<&str> = text.lines().collect();
     let mut actions = Vec::new();
-    let action = |title: String, diagnostic: &Diagnostic, edit: TextEdit, preferred: bool| {
+    let action = |title: String, diagnostic: &Diagnostic, edits: Vec<TextEdit>, preferred: bool| {
         CodeActionOrCommand::CodeAction(CodeAction {
             title,
             kind: Some(CodeActionKind::QUICKFIX),
             diagnostics: Some(vec![to_lsp(uri, &lines, diagnostic)]),
             edit: Some(WorkspaceEdit {
-                changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+                changes: Some(HashMap::from([(uri.clone(), edits)])),
                 ..WorkspaceEdit::default()
             }),
             is_preferred: Some(preferred),
@@ -448,21 +471,54 @@ fn code_actions(
             continue;
         }
         if let Some(fix) = &diagnostic.fix {
-            let edit = match &fix.edit {
-                Edit::Replace { span, text } => TextEdit::new(range(&lines, *span), text.clone()),
-                Edit::DeleteLine(line) => TextEdit::new(
-                    Range::new(Position::new(*line as u32, 0), Position::new(*line as u32 + 1, 0)),
-                    String::new(),
-                ),
-            };
-            actions.push(action(capitalise(&fix.title), &diagnostic, edit, true));
+            let edits = fix.edits.iter().map(|edit| text_edit(&lines, edit)).collect();
+            actions.push(action(capitalise(&fix.title), &diagnostic, edits, fix.safe));
         }
         let name = diagnostic.lint.name;
         let end = position(&lines, line, lines.get(line).map_or(0, |text| text.trim_end().len()));
         let silence = TextEdit::new(Range::new(end, end), format!(" ; asm-check: allow({name})"));
-        actions.push(action(format!("Silence `{name}` on this line"), &diagnostic, silence, false));
+        actions.push(action(
+            format!("Silence `{name}` on this line"),
+            &diagnostic,
+            vec![silence],
+            false,
+        ));
     }
     actions
+}
+
+/// Translates an edit, giving new lines the indentation of their neighbour.
+fn text_edit(lines: &[&str], edit: &Edit) -> TextEdit {
+    let line_text = |line: usize| lines.get(line).copied().unwrap_or("");
+    let indent = |line: usize| {
+        let text = line_text(line);
+        text[..text.len() - text.trim_start().len()].to_string()
+    };
+    let block = |line: usize, text: &str| -> Vec<String> {
+        text.lines().map(|row| format!("{}{row}", indent(line))).collect()
+    };
+    match edit {
+        Edit::Replace { span, text } => {
+            let mut rows = text.lines();
+            let mut new_text = rows.next().unwrap_or("").to_string();
+            for row in rows {
+                new_text.push_str(&format!("\n{}{row}", indent(span.line)));
+            }
+            TextEdit::new(range(lines, *span), new_text)
+        }
+        Edit::DeleteLine(line) => TextEdit::new(
+            Range::new(Position::new(*line as u32, 0), Position::new(*line as u32 + 1, 0)),
+            String::new(),
+        ),
+        Edit::InsertBefore { line, text } => {
+            let at = Position::new(*line as u32, 0);
+            TextEdit::new(Range::new(at, at), format!("{}\n", block(*line, text).join("\n")))
+        }
+        Edit::InsertAfter { line, text } => {
+            let at = position(lines, *line, line_text(*line).len());
+            TextEdit::new(Range::new(at, at), format!("\n{}", block(*line, text).join("\n")))
+        }
+    }
 }
 
 fn capitalise(text: &str) -> String {
@@ -514,7 +570,7 @@ mod tests {
         assert_eq!(lsp.range, Range::new(Position::new(1, 4), Position::new(1, 14)));
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(lsp.code, Some(NumberOrString::String("dead-store".into())));
-        assert!(lsp.message.contains("\nhelp: "));
+        assert!(lsp.message.contains("```diff\n- mov rax, 1\n```"), "{}", lsp.message);
         assert_eq!(lsp.related_information.unwrap()[0].location.range.start.line, 2);
         assert_eq!(lsp.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
         assert!(lsp.code_description.unwrap().href.as_str().ends_with("#dead-store"));

@@ -78,17 +78,37 @@ pub struct Note {
     pub message: String,
 }
 
-/// A text edit that resolves a diagnostic.
+/// A text edit. Inserted and replacement text may span several lines;
+/// every line after the first takes the indentation of the line it lands on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
-    Replace { span: Span, text: String },
+    Replace {
+        span: Span,
+        text: String,
+    },
     DeleteLine(usize),
+    /// New line(s) above the given line.
+    InsertBefore {
+        line: usize,
+        text: String,
+    },
+    /// New line(s) below the given line.
+    InsertAfter {
+        line: usize,
+        text: String,
+    },
 }
 
+/// A change that resolves a diagnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fix {
+    /// What the change does, in the imperative: "use `xor edi, edi`".
     pub title: String,
-    pub edit: Edit,
+    pub edits: Vec<Edit>,
+    /// The change cannot alter what the program does. Fixes that guess the
+    /// intent (which register to test, which size was meant) are not safe
+    /// and are never applied without the user asking.
+    pub safe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +116,10 @@ pub struct Diagnostic {
     pub lint: &'static Lint,
     pub severity: Severity,
     pub span: Span,
+    /// One short sentence. The detail goes in `label`, `notes` and `help`.
     pub message: String,
+    /// A few words shown right under the highlighted code.
+    pub label: Option<String>,
     pub help: Option<String>,
     pub notes: Vec<Note>,
     pub fix: Option<Fix>,
@@ -109,10 +132,16 @@ impl Diagnostic {
             severity: lint.group.severity(),
             span,
             message: message.into(),
+            label: None,
             help: None,
             notes: Vec::new(),
             fix: None,
         }
+    }
+
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 
     pub fn help(mut self, help: impl Into<String>) -> Self {
@@ -131,19 +160,34 @@ impl Diagnostic {
         self
     }
 
-    pub fn replace(
-        mut self,
-        title: impl Into<String>,
-        span: Span,
-        text: impl Into<String>,
-    ) -> Self {
-        self.fix =
-            Some(Fix { title: title.into(), edit: Edit::Replace { span, text: text.into() } });
+    /// Attaches a safe fix made of the given edits.
+    pub fn fix(mut self, title: impl Into<String>, edits: Vec<Edit>) -> Self {
+        self.fix = Some(Fix { title: title.into(), edits, safe: true });
         self
     }
 
-    pub fn delete_line(mut self, title: impl Into<String>, line: usize) -> Self {
-        self.fix = Some(Fix { title: title.into(), edit: Edit::DeleteLine(line) });
+    pub fn replace(self, title: impl Into<String>, span: Span, text: impl Into<String>) -> Self {
+        self.fix(title, vec![Edit::Replace { span, text: text.into() }])
+    }
+
+    pub fn delete_line(self, title: impl Into<String>, line: usize) -> Self {
+        self.fix(title, vec![Edit::DeleteLine(line)])
+    }
+
+    pub fn insert_before(
+        self,
+        title: impl Into<String>,
+        line: usize,
+        text: impl Into<String>,
+    ) -> Self {
+        self.fix(title, vec![Edit::InsertBefore { line, text: text.into() }])
+    }
+
+    /// Marks the attached fix as a guess at what was meant.
+    pub fn maybe_incorrect(mut self) -> Self {
+        if let Some(fix) = &mut self.fix {
+            fix.safe = false;
+        }
         self
     }
 }

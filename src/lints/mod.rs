@@ -1,6 +1,11 @@
 //! The lints. Each submodule declares its [`Lint`]s and a `check` pass.
 
+pub mod control;
+pub mod division;
+pub mod flags;
 pub mod operands;
+pub mod registers;
+pub mod stack;
 pub mod symbols;
 
 use crate::diagnostic::{Diagnostic, Lint};
@@ -46,10 +51,32 @@ pub static ALL: &[&Lint] = &[
     &symbols::UNDEFINED_SYMBOL,
     &symbols::DUPLICATE_LABEL,
     &symbols::ENTRY_NOT_GLOBAL,
+    &stack::UNBALANCED_STACK,
+    &stack::MISALIGNED_CALL,
+    &control::RET_IN_START,
+    &control::FALLTHROUGH,
+    &control::UNREACHABLE_CODE,
+    &control::INT80_IN_64BIT,
+    &division::DIV_WITHOUT_RDX,
+    &division::IDIV_ZERO_EXTENDED,
+    &registers::CLOBBERED_REGISTER,
+    &registers::CALLEE_SAVED_CLOBBERED,
+    &registers::DEAD_STORE,
+    &flags::FLAGS_CLOBBERED,
+    &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
+    &control::REDUNDANT_JUMP,
 ];
 
-const PASSES: &[Pass] = &[operands::check, symbols::check];
+const PASSES: &[Pass] = &[
+    operands::check,
+    symbols::check,
+    stack::check,
+    control::check,
+    division::check,
+    registers::check,
+    flags::check,
+];
 
 pub fn run(context: &Context) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();

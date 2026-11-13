@@ -134,6 +134,9 @@ fn check(cli: &Cli) -> ExitCode {
             }
         };
         let name = file.display().to_string();
+        if asm_check::is_gnu_syntax(&source) {
+            eprintln!("asm-check: {name}: skipped, GNU assembler syntax is not supported");
+        }
         let mut diagnostics = asm_check::check(&source, &config);
         diagnostics.retain(|d| d.severity >= level);
         match format {

@@ -171,7 +171,9 @@ fn check_ret(program: &Program, index: usize, state: &State, out: &mut Vec<Diagn
 fn check_call(program: &Program, index: usize, state: &State, out: &mut Vec<Diagnostic>) {
     let insn = &program.insns[index];
     let Flow::Call(target @ Target::Label(name)) = &insn.fx.flow else { return };
-    if program.callee(target) != Callee::External || program.is_noreturn(index) {
+    // An undeclared name is `undefined-symbol`'s business, not a libc call.
+    let declared = program.externs.contains(name) || program.opaque;
+    if program.callee(target) != Callee::External || !declared || program.is_noreturn(index) {
         return;
     }
     let Some(off) = state.rsp.align.filter(|align| *align != 0) else { return };

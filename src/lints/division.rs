@@ -34,6 +34,8 @@ enum Stale {
     Call(usize),
     /// The remainder of the division on this line.
     Division(usize),
+    /// Set as the third argument of the system call on this line.
+    Argument(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +106,13 @@ impl Analysis for Dividend {
             return;
         }
 
+        // A value loaded for a system call is an argument, not a dividend.
+        // A zeroed `rdx` is left alone: the kernel preserves it.
+        if insn.fx.flow == Flow::Syscall && *state == Rdx::Set {
+            *state = Rdx::Stale(Stale::Argument(insn.line));
+            return;
+        }
+
         if !insn.fx.writes.contains(RegId::RDX) {
             return;
         }
@@ -128,6 +137,10 @@ fn report(program: &Program, index: usize, state: Rdx, out: &mut Vec<Diagnostic>
             let because = match reason {
                 Stale::Entry => "is never set before this point".to_string(),
                 Stale::Call(line) => format!("was left undefined by the call on line {}", line + 1),
+                Stale::Argument(line) => format!(
+                    "still holds the third argument of the system call on line {}",
+                    line + 1
+                ),
                 Stale::Division(line) if line == insn.line => {
                     "still holds the remainder of the previous iteration".to_string()
                 }

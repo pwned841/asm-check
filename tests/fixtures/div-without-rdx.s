@@ -29,5 +29,13 @@ _start:
     jnz .bad
     mul rcx
     div rcx
+    mov rdx, 5
+    mov eax, 1
+    syscall
+    div rcx                 ;~
+    xor edx, edx
+    mov eax, 1
+    syscall
+    div rcx
     mov rax, 60
     syscall

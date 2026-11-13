@@ -11,3 +11,6 @@ keywords = ["assembly", "x86-64", "nasm", "linter", "lsp"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

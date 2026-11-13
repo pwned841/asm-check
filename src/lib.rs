@@ -6,5 +6,6 @@ pub mod ast;
 pub mod insn;
 pub mod mnemonic;
 pub mod parser;
+pub mod program;
 pub mod reg;
 pub mod span;

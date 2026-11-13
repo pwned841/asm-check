@@ -63,17 +63,20 @@ $ asm-check lints                   # list every lint
 The exit code is `0` when nothing above a hint was found, `1` on errors
 (or warnings with `-D`), `2` when a file could not be read.
 
+`examples/showcase.s` triggers every lint, one commented paragraph each:
+open it in your editor to see them all.
+
 ## Lints
 
-26 lints in four groups. [docs/lints.md](docs/lints.md) describes each one
+58 lints in four groups. [docs/lints.md](docs/lints.md) describes each one
 with an example.
 
 | Group | Severity | Lints |
 |-------|----------|-------|
-| correctness | error | `operand-size-mismatch` `ambiguous-operand-size` `invalid-operands` `undefined-symbol` `duplicate-label` `unbalanced-stack` `ret-in-start` |
-| suspicious | warning | `div-without-rdx` `idiv-zero-extended` `clobbered-register` `callee-saved-clobbered` `misaligned-call` `dead-store` `flags-clobbered` `unused-comparison` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` |
-| style | hint | `unused-label` `redundant-jump` `mov-zero` `cmp-zero` `self-move` `noop-arithmetic` |
-| pedantic | hint, opt-in | `needless-rex` |
+| correctness | error | `operand-size-mismatch` `ambiguous-operand-size` `invalid-operands` `invalid-address` `immediate-out-of-range` `jump-to-data` `unknown-instruction` `undefined-symbol` `duplicate-label` `unbalanced-stack` `ret-in-start` |
+| suspicious | warning | `misaligned-call` `mismatched-pop` `odd-stack-adjustment` `variadic-call-without-al` `main-return-value` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` `div-without-rdx` `idiv-zero-extended` `uninitialized-register` `clobbered-register` `partial-register-read` `unknown-syscall` `exit-code-truncated` `pointer-from-contents` `truncated-address` `data-size-mismatch` `write-to-readonly` `shift-out-of-range` `code-in-data-section` `data-in-bss` `unknown-section` `misplaced-length` `callee-saved-clobbered` `dead-store` `undefined-flags` `constant-comparison` `flags-clobbered` `unused-comparison` |
+| style | hint | `unused-label` `unused-extern` `redundant-jump` `jump-over-jump` `jump-to-jump` `mov-zero` `cmp-zero` `self-move` `noop-arithmetic` `lea-as-mov` `redundant-test` `redundant-push-pop` `redundant-move` |
+| pedantic | hint, opt-in | `needless-rex` `slow-loop` `absolute-address` |
 
 ### Silencing a lint
 
@@ -92,9 +95,17 @@ silences everything on that line.
 ## Editor integration
 
 `asm-check lsp` is a Language Server Protocol server over standard input
-and output. It publishes diagnostics on every change and offers two kinds
-of quick fix: the rewrite a lint suggests (`mov rax, 0` to `xor eax, eax`),
-and a comment that silences the lint on that line.
+and output.
+
+| Feature | What it does |
+|---------|--------------|
+| Diagnostics | Every lint, updated on each change, with related locations. |
+| Quick fixes | The rewrite a lint suggests (`mov rax, 0` to `xor eax, eax`), and a comment that silences the lint on that line. |
+| Hover | Instructions: what they do, the registers and flags they touch, and for `syscall` the call and its arguments. Registers: their role and sub-registers. Labels: definition, section, size, number of uses. Numbers: decimal, hex, binary, character. |
+| Inlay hints | The system call after each `syscall`: `write(fd, buf, count)`. |
+| Go to definition, find references, rename | For labels, with `.local` labels resolved in their scope. |
+| Outline | Functions, labels, data and constants. |
+| Completion | Instructions with a description, registers, and the labels in scope. |
 
 Settings are read from the initialization options:
 
@@ -198,7 +209,8 @@ source ─▶ parser ─▶ lines ─▶ program ─▶ lints ─▶ diagnostics
 4. **Lints** ([src/lints](src/lints)) come in three kinds. Some look at one
    instruction. Some walk a basic block. The ones that must know what holds
    on every path (the stack depth at `ret`, the state of `rdx` at `div`,
-   which registers a call destroyed) use a forward dataflow solver
+   which registers hold a value, whether the flags were set) use a forward
+   dataflow solver
    ([src/dataflow.rs](src/dataflow.rs)).
 
 The guiding rule is that a wrong diagnostic costs more than a missed one:

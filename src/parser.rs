@@ -131,7 +131,7 @@ fn parse_instruction(
     parent: &str,
 ) -> StmtKind {
     let mnemonic_end = ident_end(code, start).max(start + 1).min(end);
-    let operands = split_operands(code, skip_ws(code, mnemonic_end), end)
+    let operands = split_operands(code, skip_ws(code, mnemonic_end).min(end), end)
         .into_iter()
         .map(|(s, e)| parse_operand(&code[s..e], Span::new(number, s, e), parent))
         .collect();
@@ -626,9 +626,22 @@ mod tests {
 
     #[test]
     fn never_panics_on_garbage() {
-        for source in
-            ["", ";", ":", "[", "%", "mov [", "'", "db '", ", ,", "é: mov rax, 'é", "times"]
-        {
+        for source in [
+            "",
+            ";",
+            ":",
+            "[",
+            "%",
+            "mov [",
+            "'",
+            "db '",
+            ", ,",
+            "é: mov rax, 'é",
+            "times",
+            "ret ; x",
+            "rep ; x",
+            "a: ; x",
+        ] {
             parse(source);
         }
     }

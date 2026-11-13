@@ -56,7 +56,8 @@ fn parse_line(number: usize, raw: &str, parent: &mut String) -> Line {
         if !local && !special {
             *parent = word.to_string();
         }
-        line.label = Some(Label { name, span: Span::new(number, pos, word_end), local });
+        line.label =
+            Some(Label { name, span: Span::new(number, pos, word_end), local, colon: has_colon });
         pos = skip_ws(code, if has_colon { after + 1 } else { after });
     }
     if pos < code.len() {
@@ -213,6 +214,7 @@ fn parse_directive(head: &str, rest: &str) -> Directive {
         "use16" => Directive::Bits(16),
         "use32" => Directive::Bits(32),
         "use64" => Directive::Bits(64),
+        "default" if rest.to_ascii_lowercase().contains("rel") => Directive::DefaultRel,
         _ => Directive::Other(head.to_string()),
     }
 }

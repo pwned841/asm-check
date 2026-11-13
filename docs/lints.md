@@ -81,6 +81,12 @@ The second case is the dangerous one: every instruction except
 A `jmp`, a conditional jump or a `call` targets a data label. The
 processor would execute the bytes of the data.
 
+### unknown-instruction
+
+A word in instruction position that is not an instruction, but is one typo
+away from one: `mvo`, `sycall`, `pus`. A fix replaces it. Words that match
+nothing are left alone, since the tool does not know every instruction.
+
 ### undefined-symbol
 
 A name is used that is neither a label of the file nor declared `extern`,
@@ -281,6 +287,43 @@ second db "world"
 first_len equ $ - first     ; 10, not 5
 ```
 
+### mismatched-pop
+
+Registers are popped in the order they were pushed instead of the reverse,
+which swaps their values.
+
+```nasm
+push rbx
+push r12
+pop rbx         ; receives the saved r12
+pop r12         ; receives the saved rbx
+```
+
+`push rax` / `pop rdi`, used as a move, is not reported.
+
+### odd-stack-adjustment
+
+`sub rsp, 4` or `add rsp, 12`: `rsp` is moved by an amount that is not a
+multiple of 8, the size of every stack slot in 64-bit mode.
+
+### variadic-call-without-al
+
+`printf`, `scanf` and the other variadic functions read `al` as the number
+of vector registers that carry arguments. It is reported when `al` still
+holds the result of a previous call, or was never set in the function.
+Put `xor eax, eax` before the call.
+
+### main-return-value
+
+`main` reaches `ret` with `eax` holding the result of its last call, or
+never set. That value becomes the exit status: a program that prints 12
+characters with `printf` and returns exits with status 12.
+
+### constant-comparison
+
+A comparison whose outcome never varies: `cmp rax, rax` is always equal,
+`test rax, 0` always gives zero.
+
 ### callee-saved-clobbered
 
 An exported function (`global`, or `main`) changes `rbx`, `rbp` or
@@ -364,6 +407,46 @@ An `extern` declaration for a symbol the file never uses.
 
 A `jmp` to the instruction that immediately follows it.
 
+### jump-over-jump
+
+```nasm
+    jne .skip
+    jmp .target
+.skip:
+```
+
+The conditional jump only skips the `jmp`: `je .target` does the same.
+
+### jump-to-jump
+
+A jump lands on a label whose instruction is another unconditional jump.
+Jump to the final target directly.
+
+### lea-as-mov
+
+`lea rax, [rbx]` computes the address of nothing: it is `mov rax, rbx`.
+
+### redundant-test
+
+```nasm
+dec rcx
+test rcx, rcx       ; dec already set ZF and SF for rcx
+jz .done
+```
+
+Arithmetic sets the zero and sign flags from its result. Only reported
+when what follows reads those flags alone: the carry and overflow flags
+do differ between the arithmetic and a `test`.
+
+### redundant-push-pop
+
+`push rax` immediately followed by `pop rax` does nothing.
+
+### redundant-move
+
+`mov rax, rbx` followed by `mov rbx, rax`, or a store followed by a load
+of the same location: the second copies back what the first just copied.
+
 ### mov-zero
 
 `mov reg, 0` can be `xor reg32, reg32`: fewer bytes, and the form
@@ -394,3 +477,15 @@ upper half, so the result is the same and the REX prefix byte is saved.
 Not reported for `r8`-`r15`, which need the prefix either way.
 
 `mov rax, 1` is not reported: NASM already encodes it as `mov eax, 1`.
+
+### slow-loop
+
+The `loop` instruction is microcoded and slower than `dec rcx` followed by
+`jnz` on current processors.
+
+### absolute-address
+
+`[label]` without `rel` is assembled as an absolute 32-bit address.
+Position-independent executables, the default on most Linux
+distributions, need `[rel label]`, or `default rel` once at the top of the
+file.

@@ -14,6 +14,18 @@ pub static UNBALANCED_STACK: Lint = Lint {
     summary: "`ret` reached with pushes and pops that do not match",
 };
 
+pub static MISMATCHED_POP: Lint = Lint {
+    name: "mismatched-pop",
+    group: Group::Suspicious,
+    summary: "registers popped in the same order they were pushed, which swaps them",
+};
+
+pub static ODD_STACK_ADJUSTMENT: Lint = Lint {
+    name: "odd-stack-adjustment",
+    group: Group::Suspicious,
+    summary: "`rsp` moved by an amount that is not a multiple of 8",
+};
+
 pub static MISALIGNED_CALL: Lint = Lint {
     name: "misaligned-call",
     group: Group::Suspicious,
@@ -41,11 +53,15 @@ impl Position {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 struct State {
     rsp: Position,
     /// Where `rsp` was when it was copied to `rbp`, while `rbp` still holds it.
     frame: Option<Position>,
+    /// What each `push` since the function entry put on the stack: the
+    /// register it came from, when it is one. `None` once `rsp` has moved
+    /// in a way pushes and pops do not explain.
+    pushed: Option<Vec<Option<RegId>>>,
 }
 
 struct Stack;
@@ -57,7 +73,11 @@ impl Analysis for Stack {
         // The kernel starts a process with an aligned stack; a `call`
         // pushes an 8-byte return address on top of an aligned one.
         let align = if function.entry_point { 0 } else { 8 };
-        State { rsp: Position { depth: Some(0), align: Some(align) }, frame: None }
+        State {
+            rsp: Position { depth: Some(0), align: Some(align) },
+            frame: None,
+            pushed: Some(Vec::new()),
+        }
     }
 
     fn unknown(&self) -> State {
@@ -72,6 +92,7 @@ impl Analysis for Stack {
                 align: same(a.rsp.align, b.rsp.align),
             },
             frame: if a.frame == b.frame { a.frame } else { None },
+            pushed: if a.pushed == b.pushed { a.pushed.clone() } else { None },
         }
     }
 
@@ -80,15 +101,61 @@ impl Analysis for Stack {
         program: &Program,
         index: usize,
         state: &mut State,
-        out: Option<&mut Vec<Diagnostic>>,
+        mut out: Option<&mut Vec<Diagnostic>>,
     ) {
         let insn = &program.insns[index];
         let operands = &insn.ins.operands;
         let reg = |i: usize| operands.get(i).and_then(Operand::as_reg).map(|reg| reg.id);
         let constant = operands.get(1).and_then(Operand::constant);
         let mut keeps_frame = false;
+        let mnemonic = insn.ins.mnemonic.as_str();
 
-        match (insn.ins.mnemonic.as_str(), reg(0), reg(1)) {
+        // Pushes and pops keep the model of the stack contents; anything
+        // else that moves `rsp` invalidates it.
+        match mnemonic {
+            "push" | "pushf" | "pushfq" => {
+                if let Some(stack) = &mut state.pushed {
+                    stack.push(reg(0));
+                }
+            }
+            "pop" | "popf" | "popfq" => {
+                let top = state.pushed.as_mut().and_then(Vec::pop);
+                match (top, reg(0)) {
+                    (None, _) => state.pushed = None,
+                    (Some(Some(pushed)), Some(popped)) => {
+                        let waiting = |stack: &Vec<Option<RegId>>| stack.contains(&Some(popped));
+                        if pushed != popped
+                            && state.pushed.as_ref().is_some_and(waiting)
+                            && let Some(out) = out.as_deref_mut()
+                        {
+                            out.push(mismatched_pop(insn, pushed, popped));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ if insn.fx.writes.contains(RegId::RSP) && !matches!(mnemonic, "call" | "ret") => {
+                state.pushed = None;
+            }
+            _ => {}
+        }
+        if matches!(mnemonic, "sub" | "add")
+            && reg(0) == Some(RegId::RSP)
+            && let Some(bytes) = constant.filter(|bytes| bytes % 8 != 0)
+            && let Some(out) = out.as_deref_mut()
+        {
+            out.push(
+                Diagnostic::new(
+                    &ODD_STACK_ADJUSTMENT,
+                    insn.span,
+                    format!("`rsp` is moved by {bytes} bytes, which is not a multiple of 8"),
+                )
+                .note("every `push`, `pop`, `call` and `ret` works on 8-byte slots")
+                .help(format!("round up to {}", (bytes + 7) / 8 * 8)),
+            );
+        }
+
+        match (mnemonic, reg(0), reg(1)) {
             ("push" | "pushf" | "pushfq", _, _) => state.rsp.grow(8),
             ("pop", Some(RegId::RSP), _) => state.rsp = Position::default(),
             ("pop" | "popf" | "popfq", _, _) => state.rsp.grow(-8),
@@ -136,6 +203,18 @@ impl Analysis for Stack {
             state.frame = None;
         }
     }
+}
+
+fn mismatched_pop(insn: &crate::program::Insn, pushed: RegId, popped: RegId) -> Diagnostic {
+    Diagnostic::new(
+        &MISMATCHED_POP,
+        insn.span,
+        format!("`pop {popped}` takes the value that `push {pushed}` saved"),
+    )
+    .note(format!(
+        "`{popped}` was pushed earlier and is still on the stack: the two end up swapped"
+    ))
+    .help("pop registers in the reverse order of the pushes")
 }
 
 fn check_ret(program: &Program, index: usize, state: &State, out: &mut Vec<Diagnostic>) {

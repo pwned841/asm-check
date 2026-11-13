@@ -36,6 +36,43 @@ pub static REDUNDANT_JUMP: Lint = Lint {
     summary: "a `jmp` to the instruction that follows it",
 };
 
+pub static JUMP_OVER_JUMP: Lint = Lint {
+    name: "jump-over-jump",
+    group: Group::Style,
+    summary: "a conditional jump that only skips a `jmp`, where the opposite condition would do",
+};
+
+pub static JUMP_TO_JUMP: Lint = Lint {
+    name: "jump-to-jump",
+    group: Group::Style,
+    summary: "a jump to a label that immediately jumps somewhere else",
+};
+
+/// The condition code that is true exactly when `code` is false.
+fn opposite(code: &str) -> Option<&'static str> {
+    const PAIRS: &[(&str, &str)] = &[
+        ("e", "ne"),
+        ("z", "nz"),
+        ("l", "ge"),
+        ("le", "g"),
+        ("b", "ae"),
+        ("be", "a"),
+        ("s", "ns"),
+        ("o", "no"),
+        ("p", "np"),
+        ("c", "nc"),
+    ];
+    PAIRS.iter().find_map(|(yes, no)| {
+        if *yes == code {
+            Some(*no)
+        } else if *no == code {
+            Some(*yes)
+        } else {
+            None
+        }
+    })
+}
+
 const EXIT_HELP: &str =
     "end with `ret`, a `jmp`, or the exit system call (`mov eax, 60` / `syscall`)";
 
@@ -121,6 +158,52 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     }
 
     for (index, insn) in program.insns.iter().enumerate() {
+        let target_of = |name: &String| program.symbols.get(name).and_then(|symbol| symbol.insn);
+
+        // jcc .skip / jmp target / .skip:
+        if let Flow::CondJump(Target::Label(skip)) = &insn.fx.flow
+            && let Some(("j", code)) = crate::mnemonic::condition(&insn.ins.mnemonic)
+            && let Some(next) = program.insns.get(index + 1)
+            && next.run == insn.run
+            && next.labels.is_empty()
+            && let Flow::Jump(Target::Label(_)) = &next.fx.flow
+            && target_of(skip) == Some(index + 2)
+            && let Some(operand) = next.ins.operands.first()
+        {
+            let mut diagnostic = Diagnostic::new(
+                &JUMP_OVER_JUMP,
+                insn.span,
+                format!("`{}` only skips the `jmp` that follows it", cx.code(insn)),
+            );
+            if let Some(opposite) = opposite(code) {
+                diagnostic = diagnostic.help(format!(
+                    "use `j{opposite} {}` and remove the `jmp`",
+                    cx.text(operand.span)
+                ));
+            }
+            out.push(diagnostic);
+        }
+
+        // A jump whose target is itself an unconditional jump.
+        if let Flow::Jump(Target::Label(name)) | Flow::CondJump(Target::Label(name)) = &insn.fx.flow
+            && let Some(landing) = target_of(name)
+            && landing != index
+            && let Flow::Jump(Target::Label(onward)) = &program.insns[landing].fx.flow
+            && onward != name
+            && let (Some(from), Some(to)) =
+                (insn.ins.operands.first(), program.insns[landing].ins.operands.first())
+        {
+            let (from, to) = (cx.text(from.span), cx.text(to.span));
+            out.push(
+                Diagnostic::new(
+                    &JUMP_TO_JUMP,
+                    insn.span,
+                    format!("`{from}` only jumps on to `{to}`"),
+                )
+                .help(format!("jump to `{to}` directly")),
+            );
+        }
+
         match &insn.fx.flow {
             Flow::Int(Some(0x80)) => out.push(
                 Diagnostic::new(

@@ -5,6 +5,7 @@ use crate::ast::StmtKind;
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::insn::{Flow, Target};
 use crate::program::SymbolKind;
+use crate::text;
 
 pub static CODE_IN_DATA_SECTION: Lint = Lint {
     name: "code-in-data-section",
@@ -79,7 +80,7 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
         let dotted = format!(".{}", name.trim_start_matches('.'));
         let intended = STANDARD
             .into_iter()
-            .find(|standard| *standard == dotted || distance_at_most_one(standard, name));
+            .find(|standard| *standard == dotted || text::typo_distance(standard, name) == 1);
         if let Some(intended) = intended {
             out.push(
                 Diagnostic::new(
@@ -156,37 +157,5 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 ));
             }
         }
-    }
-}
-
-/// Whether `b` is `a` with one character changed, added or removed.
-fn distance_at_most_one(a: &str, b: &str) -> bool {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    if a == b || a.len().abs_diff(b.len()) > 1 {
-        return false;
-    }
-    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let suffix = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
-    let longest = a.len().max(b.len());
-    // Two neighbours swapped (`.bbs`) count as one mistake.
-    let swapped = a.len() == b.len()
-        && prefix + suffix + 2 == longest
-        && a[prefix] == b[prefix + 1]
-        && a[prefix + 1] == b[prefix];
-    prefix + suffix + 1 >= longest || swapped
-}
-
-#[cfg(test)]
-mod tests {
-    use super::distance_at_most_one;
-
-    #[test]
-    fn near_misses() {
-        assert!(distance_at_most_one(".text", ".txt"));
-        assert!(distance_at_most_one(".data", ".date"));
-        assert!(distance_at_most_one(".bss", ".bbs"));
-        assert!(distance_at_most_one(".bss", ".bs"));
-        assert!(!distance_at_most_one(".text", ".text"));
-        assert!(!distance_at_most_one(".text", ".mycode"));
     }
 }

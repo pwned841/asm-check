@@ -6,6 +6,12 @@ use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::insn::{Flags, Flow};
 use crate::program::{Function, Insn, Program};
 
+pub static CONSTANT_COMPARISON: Lint = Lint {
+    name: "constant-comparison",
+    group: Group::Suspicious,
+    summary: "a comparison whose result never changes, such as `cmp rax, rax` or `test rax, 0`",
+};
+
 pub static UNDEFINED_FLAGS: Lint = Lint {
     name: "undefined-flags",
     group: Group::Suspicious,
@@ -38,6 +44,31 @@ struct Comparison {
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
     let program = cx.program;
     dataflow::run(program, &FlagsSet, out);
+    for insn in &program.insns {
+        let (Some(a), Some(b)) = (insn.ins.operands.first(), insn.ins.operands.get(1)) else {
+            continue;
+        };
+        let code = cx.code(insn);
+        match insn.ins.mnemonic.as_str() {
+            "cmp" if a.as_reg().is_some() && a.as_reg() == b.as_reg() => out.push(
+                Diagnostic::new(
+                    &CONSTANT_COMPARISON,
+                    insn.span,
+                    format!("`{code}` compares a register with itself: always equal"),
+                )
+                .help(format!("to check for zero, use `test {0}, {0}`", cx.text(a.span))),
+            ),
+            "test" if b.constant() == Some(0) => out.push(
+                Diagnostic::new(
+                    &CONSTANT_COMPARISON,
+                    insn.span,
+                    format!("`{code}` always gives zero: `test` ANDs its operands"),
+                )
+                .help("test against the bits you care about, or the operand against itself"),
+            ),
+            _ => {}
+        }
+    }
     for block in &program.blocks {
         let mut current: Option<Comparison> = None;
         for index in block.start..block.end {

@@ -49,9 +49,23 @@ exported:
     call printf                 ; misaligned-call: rsp is 8 bytes off
     ret
 
+swapped:
+    push rbx
+    push r12
+    pop rbx                     ; mismatched-pop: receives the saved r12
+    pop r12
+    ret
+
+main:
+    lea rdi, [rel message]
+    call printf                 ; variadic-call-without-al: al was never set
+    ret                         ; main-return-value: returns what printf returned
+
 ; ---------------------------------------------------------------- division
 
 division:
+    sub rsp, 4                  ; odd-stack-adjustment: not a multiple of 8
+    add rsp, 4
     mov rax, 100
     mov rcx, 7
     div rcx                     ; div-without-rdx: rdx was never set
@@ -104,6 +118,20 @@ flags:
 .ten:
     ret
 
+comparisons:
+    cmp rax, rax                ; constant-comparison: always equal
+    dec rcx
+    test rcx, rcx               ; redundant-test: dec already set the flags
+    jz .out
+    jne .skip                   ; jump-over-jump: use `je .hop`
+    jmp .hop                    ; jump-to-jump: .hop only jumps on to .out
+.skip:
+    nop
+.hop:
+    jmp .out
+.out:
+    ret
+
 ; ------------------------------------------------------------ control flow
 
 control:
@@ -123,6 +151,15 @@ style:
     cmp rbx, 0                  ; cmp-zero: test rbx, rbx
     mov rcx, rcx                ; self-move: does nothing
     add rdx, 0                  ; noop-arithmetic: leaves rdx unchanged
+    lea rax, [rbx]              ; lea-as-mov: mov rax, rbx
+    push rax                    ; redundant-push-pop: undone by the pop
+    pop rax
+    mov rax, rbx
+    mov rbx, rax                ; redundant-move: copies back the same value
+    mvo rax, 1                  ; unknown-instruction: did you mean `mov`?
+    mov rax, [value]            ; absolute-address (pedantic): use [rel value]
+.spin:
+    loop .spin                  ; slow-loop (pedantic): dec rcx / jnz
     xor rsi, rsi                ; needless-rex (pedantic): xor esi, esi
     ret
 
@@ -152,6 +189,9 @@ _start:
     call duplicate
     call syscalls
     call memory
+    call swapped
+    call main
+    call comparisons
 .done:
     ret                         ; ret-in-start: there is no return address
 

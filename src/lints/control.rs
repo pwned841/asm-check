@@ -48,6 +48,52 @@ pub static JUMP_TO_JUMP: Lint = Lint {
     summary: "a jump to a label that immediately jumps somewhere else",
 };
 
+pub static INFINITE_LOOP: Lint = Lint {
+    name: "infinite-loop",
+    group: Group::Suspicious,
+    summary: "a loop whose condition tests values the loop never changes",
+};
+
+/// A block that jumps back to its own start on a comparison of things it
+/// never modifies: once taken, the jump is always taken.
+fn infinite_loops(cx: &Context, out: &mut Vec<Diagnostic>) {
+    let program = cx.program;
+    for (index, block) in program.blocks.iter().enumerate() {
+        let jump = &program.insns[block.end - 1];
+        if !matches!(jump.fx.flow, Flow::CondJump(_)) || !block.succs.contains(&index) {
+            continue;
+        }
+        let body = &program.insns[block.start..block.end - 1];
+        // The comparison the jump depends on must be the last flag writer.
+        let Some(position) = body.iter().rposition(|insn| !insn.fx.flags_written.is_empty()) else {
+            continue;
+        };
+        let test = &body[position];
+        if !matches!(test.ins.mnemonic.as_str(), "cmp" | "test") {
+            continue;
+        }
+        let compares_memory = test.ins.operands.iter().any(|operand| operand.is_mem());
+        let unchanged = body.iter().all(|insn| {
+            insn.fx.known
+                && insn.fx.flow == Flow::Next
+                && insn.fx.writes.intersection(test.fx.reads).is_empty()
+                // With a memory operand, any store could be the update.
+                && !(compares_memory
+                    && (insn.ins.operands.first().is_some_and(|operand| operand.is_mem())
+                        && insn.ins.mnemonic != "cmp"
+                        && insn.ins.mnemonic != "test"
+                        || insn.ins.operands.is_empty()))
+        });
+        if unchanged {
+            out.push(
+                Diagnostic::new(&INFINITE_LOOP, jump.span, "this loop never changes what it tests")
+                    .label("once taken, always taken")
+                    .note_at(test.span, "nothing in the loop modifies these operands"),
+            );
+        }
+    }
+}
+
 /// The condition code that is true exactly when `code` is false.
 fn opposite(code: &str) -> Option<&'static str> {
     const PAIRS: &[(&str, &str)] = &[
@@ -83,6 +129,7 @@ fn ending(entry_point: bool) -> (&'static str, &'static str) {
 }
 
 pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
+    infinite_loops(cx, out);
     let program = cx.program;
 
     for function in &program.functions {

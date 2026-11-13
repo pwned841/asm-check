@@ -101,6 +101,16 @@ syscalls:
     syscall
     mov eax, 400
     syscall                     ; unknown-syscall: no such number
+    xor eax, eax
+    mov rsi, buffer
+    mov edx, 128
+    syscall                     ; buffer-overflow: 128 bytes into a 64-byte buffer
+    mov eax, 2
+    mov rdi, greeting
+    syscall                     ; missing-nul-terminator: `greeting` has no final 0
+.wait:
+    cmp rbx, 5
+    jne .wait                   ; infinite-loop: nothing changes rbx
     mov edi, 256
     mov eax, 60
     syscall                     ; exit-code-truncated: the shell sees 0

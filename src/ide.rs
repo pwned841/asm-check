@@ -195,20 +195,50 @@ impl Document {
         outline
     }
 
-    /// `write(fd, buf, count)` after each `syscall` whose number is known:
-    /// the position (line, byte column) and the text.
+    /// Hints that spell out what the code does, as `(line, byte column,
+    /// text)`:
+    /// - after `syscall`, the call and the values of its arguments;
+    /// - after a conditional jump, the condition it tests;
+    /// - after a byte-sized number, the character it stands for.
     pub fn inlay_hints(&self) -> Vec<(usize, usize, String)> {
-        let program = Program::build(&self.lines);
-        program
-            .insns
-            .iter()
-            .enumerate()
-            .filter(|(_, insn)| insn.fx.flow == Flow::Syscall)
-            .filter_map(|(index, insn)| {
-                let syscall = syscalls::lookup(program.constant_before(index, RegId::RAX)?)?;
-                Some((insn.line, insn.span.end, syscall.signature()))
-            })
-            .collect()
+        let mut program = Program::build(&self.lines);
+        program.text = self.text.iter().map(String::as_str).collect();
+        let mut hints = Vec::new();
+        for (index, insn) in program.insns.iter().enumerate() {
+            if insn.fx.flow == Flow::Syscall
+                && let Some(number) = program.constant_before(index, RegId::RAX)
+                && let Some(syscall) = syscalls::lookup(number)
+            {
+                let arguments: Vec<String> = syscall
+                    .registers()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, reg)| {
+                        let name = syscall.param(position);
+                        match argument_text(&program, index, *reg) {
+                            Some(value) => format!("{name}={value}"),
+                            None => name.to_string(),
+                        }
+                    })
+                    .collect();
+                let text = format!("{}({})", syscall.name, arguments.join(", "));
+                hints.push((insn.line, insn.span.end, text));
+            }
+            if let Some(condition) = condition_text(&program, index) {
+                hints.push((insn.line, insn.span.end, format!("if {condition}")));
+            }
+            // `cmp al, 48` reads better with the character next to it.
+            if let [dest, source] = insn.ins.operands.as_slice()
+                && dest.bits() == Some(8)
+                && let Some(value) = source.constant().and_then(|value| u8::try_from(value).ok())
+                && (value.is_ascii_graphic() || value == b' ')
+                && program.snippet(source.span).as_bytes().first().is_some_and(u8::is_ascii_digit)
+            {
+                hints.push((insn.line, source.span.end, format!("'{}'", value as char)));
+            }
+        }
+        hints.sort();
+        hints
     }
 
     pub fn completions(&self, line: usize, column: usize) -> Vec<Completion> {
@@ -391,6 +421,72 @@ impl Document {
     }
 }
 
+/// How the source sets a register before the instruction at `index`:
+/// the constant, the symbol or the expression it is loaded from.
+fn argument_text(program: &Program, index: usize, reg: RegId) -> Option<String> {
+    let write = &program.insns[program.last_write_before(index, reg)?];
+    if write.fx.zeroing {
+        return Some("0".to_string());
+    }
+    let source = write.ins.operands.get(1)?;
+    let text = program.snippet(source.span).trim();
+    match write.ins.mnemonic.as_str() {
+        "mov" | "movzx" | "movsx" | "movsxd" => Some(text.to_string()),
+        // `lea rsi, [rel msg]` passes `msg`.
+        "lea" => {
+            let inner = text.trim_start_matches('[').trim_end_matches(']').trim();
+            Some(inner.strip_prefix("rel ").unwrap_or(inner).trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The condition a conditional jump tests, written out: `rax < 5`.
+fn condition_text(program: &Program, index: usize) -> Option<String> {
+    let insn = &program.insns[index];
+    let ("j", code) = crate::mnemonic::condition(&insn.ins.mnemonic)? else { return None };
+    // The instruction that set the flags, in the same straight line.
+    let block = &program.blocks[insn.block];
+    let setter = program.insns[block.start..index]
+        .iter()
+        .rev()
+        .take_while(|earlier| earlier.fx.known && earlier.fx.flow == Flow::Next)
+        .find(|earlier| !earlier.fx.flags_written.is_empty())?;
+    let operand = |i: usize| setter.ins.operands.get(i).map(|op| program.snippet(op.span).trim());
+    let (a, b) = (operand(0)?, operand(1));
+
+    let unsigned =
+        matches!(code, "b" | "c" | "nae" | "be" | "na" | "a" | "nbe" | "ae" | "nb" | "nc");
+    let relation = match code {
+        "e" | "z" => "==",
+        "ne" | "nz" => "!=",
+        "l" | "nge" | "b" | "c" | "nae" => "<",
+        "le" | "ng" | "be" | "na" => "<=",
+        "g" | "nle" | "a" | "nbe" => ">",
+        "ge" | "nl" | "ae" | "nb" | "nc" => ">=",
+        "s" => "< 0",
+        "ns" => ">= 0",
+        _ => return None,
+    };
+    let sign_test = matches!(code, "s" | "ns");
+    let zero_test = matches!(code, "e" | "z" | "ne" | "nz");
+    let arithmetic = matches!(
+        setter.ins.mnemonic.as_str(),
+        "add" | "sub" | "and" | "or" | "xor" | "inc" | "dec" | "neg" | "shl" | "shr" | "sar"
+    );
+    let text = match (setter.ins.mnemonic.as_str(), b) {
+        ("cmp", Some(b)) if !sign_test => format!("{a} {relation} {b}"),
+        ("test", Some(b)) if a == b && sign_test => format!("{a} {relation}"),
+        ("test", Some(b)) if a == b && zero_test => format!("{a} {relation} 0"),
+        ("test", Some(b)) if zero_test => format!("({a} & {b}) {relation} 0"),
+        // After arithmetic, the flags describe the result.
+        _ if arithmetic && sign_test => format!("{a} {relation}"),
+        _ if arithmetic && zero_test => format!("{a} {relation} 0"),
+        _ => return None,
+    };
+    Some(if unsigned { format!("{text} (unsigned)") } else { text })
+}
+
 /// `rax`, `rdx`, in backticks.
 fn registers(set: RegSet) -> String {
     set.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ")
@@ -533,8 +629,31 @@ length equ $ - message
     fn hints_name_the_system_calls() {
         assert_eq!(
             doc().inlay_hints(),
-            [(7, 11, "write(fd, buf, count)".to_string()), (13, 11, "exit(status)".to_string())]
+            [
+                (7, 11, "write(fd=1, buf=message, count=length)".to_string()),
+                (11, 13, "if rbx != 0".to_string()),
+                (13, 11, "exit(status)".to_string()),
+            ]
         );
+    }
+
+    #[test]
+    fn hints_spell_out_conditions_and_characters() {
+        let hints = |source: &str| -> Vec<String> {
+            Document::new(source).inlay_hints().into_iter().map(|(_, _, text)| text).collect()
+        };
+        assert_eq!(hints("f:\n cmp rax, 5\n jl f\n"), ["if rax < 5"]);
+        assert_eq!(hints("f:\n cmp rdi, rsi\n mov rax, 1\n jae f\n"), ["if rdi >= rsi (unsigned)"]);
+        assert_eq!(hints("f:\n test rax, rax\n js f\n"), ["if rax < 0"]);
+        assert_eq!(hints("f:\n test al, 1\n jz f\n"), ["if (al & 1) == 0"]);
+        assert_eq!(hints("f:\n cmp byte [rsi], 48\n je f\n"), ["'0'", "if byte [rsi] == 48"]);
+        assert_eq!(
+            hints("f:\n lea rsi, [rel msg]\n xor edi, edi\n mov eax, 1\n syscall\n"),
+            ["write(fd=0, buf=msg, count)"]
+        );
+        // The flags come from before a label: no claim is made.
+        assert!(hints("f:\n cmp rax, 5\ng:\n jl f\n").is_empty());
+        assert!(hints("f:\n cmp al, 'a'\n").is_empty());
     }
 
     #[test]

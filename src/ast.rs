@@ -46,6 +46,8 @@ pub enum StmtKind {
         symbols: Vec<String>,
         /// Bytes occupied, when the directive and its operands say so.
         size: Option<u64>,
+        /// The last value is a zero byte: a C string.
+        terminated: bool,
     },
     /// `name equ expr`.
     Equ {

@@ -9,30 +9,42 @@ your loop counter, or that the `je` you wrote tests the wrong instruction.
 
 ```console
 $ asm-check examples/demo.s
-warning[clobbered-register]: `rcx` is read here, but the `syscall` on line 13 destroyed its value
+warning[clobbered-register]: `rcx` was destroyed by `syscall`
   --> examples/demo.s:14:9
    |
+13 |     syscall
+   |     ------- `syscall` overwrites `rcx` and `r11`
 14 |     dec rcx
-   |         ^^^
+   |         ^^^ read here
    |
-   = note: the kernel uses `rcx` and `r11` to return from `syscall`: both are destroyed
-   = help: keep the value in another register, or `push`/`pop` it around the `syscall`
+   = help: keep the value in a register `syscall` preserves, such as `r12`
 
-warning[div-without-rdx]: `div` divides `rdx:rax`, but `rdx` still holds the third argument of the system call on line 13
+warning[div-without-rdx]: `rdx` is not set up for `div`
   --> examples/demo.s:21:5
    |
+13 |     syscall
+   |     ------- `rdx` was the 3rd argument of this call
+...
 21 |     div rbx
-   |     ^^^^^^^
+   |     ^^^^^^^ divides `rdx:rax`
    |
-   = note: a leftover `rdx` gives a wrong quotient, or a divide error (SIGFPE) when the quotient does not fit
-   = help: clear it first with `xor edx, edx`
+help: clear `rdx` first
+   |
+   +     xor edx, edx
+21 |     div rbx
 
-warning[flags-clobbered]: `je` tests the flags of `add` (line 25), not those of the `cmp` on line 24
-  --> examples/demo.s:26:5
+error[ambiguous-operand-size]: the size of `[result]` is not specified
+  --> examples/demo.s:28:9
    |
-26 |     je .ten
-   |     ^^^^^^^
-   ...
+28 |     mov [result], 0
+   |         ^^^^^^^^ 1, 2, 4 or 8 bytes?
+   |
+help: it is declared as `qword`
+   |
+28 -     mov [result], 0
+   +     mov qword [result], 0
+
+...
 asm-check: 1 error, 4 warnings, 1 hint in 1 file
 ```
 
@@ -57,6 +69,8 @@ $ asm-check --level warning file.s  # hide the style hints
 $ asm-check -A unused-label file.s  # silence one lint
 $ asm-check -D file.s               # warnings make the exit code non-zero
 $ asm-check --format json file.s    # machine-readable
+$ asm-check --fix file.s            # apply the safe fixes in place
+$ asm-check --fix --unsafe-fixes file.s   # also the ones that guess the intent
 $ asm-check lints                   # list every lint
 ```
 
@@ -68,13 +82,13 @@ open it in your editor to see them all.
 
 ## Lints
 
-58 lints in four groups. [docs/lints.md](docs/lints.md) describes each one
+61 lints in four groups. [docs/lints.md](docs/lints.md) describes each one
 with an example.
 
 | Group | Severity | Lints |
 |-------|----------|-------|
 | correctness | error | `operand-size-mismatch` `ambiguous-operand-size` `invalid-operands` `invalid-address` `immediate-out-of-range` `jump-to-data` `unknown-instruction` `undefined-symbol` `duplicate-label` `unbalanced-stack` `ret-in-start` |
-| suspicious | warning | `misaligned-call` `mismatched-pop` `odd-stack-adjustment` `variadic-call-without-al` `main-return-value` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` `div-without-rdx` `idiv-zero-extended` `uninitialized-register` `clobbered-register` `partial-register-read` `unknown-syscall` `exit-code-truncated` `pointer-from-contents` `truncated-address` `data-size-mismatch` `write-to-readonly` `shift-out-of-range` `code-in-data-section` `data-in-bss` `unknown-section` `misplaced-length` `callee-saved-clobbered` `dead-store` `undefined-flags` `constant-comparison` `flags-clobbered` `unused-comparison` |
+| suspicious | warning | `misaligned-call` `mismatched-pop` `odd-stack-adjustment` `variadic-call-without-al` `main-return-value` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` `div-without-rdx` `idiv-zero-extended` `uninitialized-register` `clobbered-register` `partial-register-read` `unknown-syscall` `exit-code-truncated` `pointer-from-contents` `buffer-overflow` `missing-nul-terminator` `infinite-loop` `truncated-address` `data-size-mismatch` `write-to-readonly` `shift-out-of-range` `code-in-data-section` `data-in-bss` `unknown-section` `misplaced-length` `callee-saved-clobbered` `dead-store` `undefined-flags` `constant-comparison` `flags-clobbered` `unused-comparison` |
 | style | hint | `unused-label` `unused-extern` `redundant-jump` `jump-over-jump` `jump-to-jump` `mov-zero` `cmp-zero` `self-move` `noop-arithmetic` `lea-as-mov` `redundant-test` `redundant-push-pop` `redundant-move` |
 | pedantic | hint, opt-in | `needless-rex` `slow-loop` `absolute-address` |
 
@@ -92,6 +106,22 @@ with an example.
 A comment on its own line applies to the next statement. `allow(all)`
 silences everything on that line.
 
+### Fixes
+
+Most lints come with a fix, printed as a diff and offered in the editor as
+a code action. Several are inferred from the rest of the program:
+
+- `mov [counter], 0` gets the size `counter` was declared with;
+- `jz` after a `mov` gets a `test` of the register that was just loaded;
+- a `ret` with registers still pushed gets the matching `pop`s, in order;
+- the 4th system call argument put in `rcx` is moved to `r10`;
+- `and rax, 0xFFFFFFFF` becomes `mov eax, eax`;
+- a `cmp` separated from its jump is moved next to it, when nothing in
+  between changes what it compares.
+
+A fix is *safe* when it cannot change what the program does. `--fix`
+applies only those; fixes that guess the intent need `--unsafe-fixes`.
+
 ## Editor integration
 
 `asm-check lsp` is a Language Server Protocol server over standard input
@@ -99,10 +129,10 @@ and output.
 
 | Feature | What it does |
 |---------|--------------|
-| Diagnostics | Every lint, updated on each change, with related locations. |
-| Quick fixes | The rewrite a lint suggests (`mov rax, 0` to `xor eax, eax`), and a comment that silences the lint on that line. |
+| Diagnostics | Every lint, updated on each change: a one-line message, the related locations, and the fix as a diff. |
+| Quick fixes | The fix of each lint, and a comment that silences it on that line. |
 | Hover | Instructions: what they do, the registers and flags they touch, and for `syscall` the call and its arguments. Registers: their role and sub-registers. Labels: definition, section, size, number of uses. Numbers: decimal, hex, binary, character. |
-| Inlay hints | The system call after each `syscall`: `write(fd, buf, count)`. |
+| Inlay hints | After `syscall`, the call with its argument values: `write(fd=1, buf=message, count=6)`. After a conditional jump, the condition it tests: `if rax < 5`. After a byte-sized number, its character: `'0'`. |
 | Go to definition, find references, rename | For labels, with `.local` labels resolved in their scope. |
 | Outline | Functions, labels, data and constants. |
 | Completion | Instructions with a description, registers, and the labels in scope. |

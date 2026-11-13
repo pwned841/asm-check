@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+- Diagnostics are one short sentence, with a label under the code and on
+  the related lines, in the manner of rustc.
+- Fixes are shown as a diff, in the terminal and in the editor, and can
+  change several lines. Most lints now have one; several infer the intent
+  from the rest of the program (declared size, register just loaded,
+  registers pushed, `r10` for `rcx`).
+- `--fix` applies the safe fixes in place; `--unsafe-fixes` adds the others.
+- Inlay hints: argument values after `syscall`
+  (`write(fd=1, buf=message, count=6)`), the condition after a conditional
+  jump (`if rax < 5`), the character after a byte-sized number.
+- New lints, 61 in total: `buffer-overflow`, `missing-nul-terminator`,
+  `infinite-loop`.
+- Data definitions continued on unlabelled lines are measured as a whole.
+
 ## 0.2.0
 
 - 32 new lints, 58 in total. Highlights:

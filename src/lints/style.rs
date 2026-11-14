@@ -34,7 +34,7 @@ pub static NOOP_ARITHMETIC: Lint = Lint {
 pub static NEEDLESS_REX: Lint = Lint {
     name: "needless-rex",
     group: Group::Pedantic,
-    summary: "`xor r64, r64`, which the 32-bit form does in one byte less",
+    summary: "`xor r64, r64` or `movzx r64, ...`, which the 32-bit form does in one byte less",
 };
 
 pub static LEA_AS_MOV: Lint = Lint {
@@ -271,6 +271,33 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
                 }
             }
             "mov" if same_register && dest.width != Width::W32 => out.push(self_move(cx, index)),
+            // `movzx r64, ...` already zero-extends from the 32-bit form: the
+            // REX.W prefix is an extra byte. With r8-r15 the prefix is needed anyway.
+            "movzx"
+                if dest.width == Width::W64
+                    && dest.id.index() < 8
+                    && second.bits().is_some_and(|bits| bits <= 16)
+                    && match &second.kind {
+                        OperandKind::Reg(reg) => reg.id.index() < 8,
+                        OperandKind::Mem(mem) => mem.regs.iter().all(|reg| reg.id.index() < 8),
+                        _ => false,
+                    } =>
+            {
+                let replacement = format!("movzx {small}, {}", cx.text(second.span));
+                out.push(
+                    Diagnostic::new(
+                        &NEEDLESS_REX,
+                        insn.span,
+                        format!("`{}` zero-extends to 64 bits already", cx.code(insn)),
+                    )
+                    .label("the 32-bit form is one byte shorter")
+                    .replace(
+                        format!("use `{replacement}`"),
+                        insn.span,
+                        replacement,
+                    ),
+                );
+            }
             "xor" if same_register && dest.width == Width::W64 && dest.id.index() < 8 => {
                 let replacement = format!("xor {small}, {small}");
                 out.push(

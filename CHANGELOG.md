@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+- Editor popups are plain text: the headline, then the fix on one line
+  (`fix: mov [x], 0  →  mov byte [x], 0`, `fix: remove mov rax, rax`).
+  Zed does not render Markdown in diagnostics. Fix previews no longer copy
+  the comment at the end of the line.
+- A new `performance` group, on by default, whose lints follow what
+  registers hold, what comparisons compare and which flags are read:
+  `redundant-load` (inside loops), `div-by-power-of-two`,
+  `mul-by-power-of-two`, `fold-constants`, `use-lea`,
+  `redundant-memory-load`, `mergeable-stores`, `jump-to-ret`.
+- `constant-condition`: a conditional jump whose outcome is decided.
+- `needless-rex` also covers `movzx r64, ...`.
+- `70` lints in total.
+- Fixed a duplicate: `mov rax, rax` is no longer also a `dead-store`.
+
 ## 0.3.0
 
 - Diagnostics are one short sentence, with a label under the code and on

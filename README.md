@@ -82,14 +82,15 @@ open it in your editor to see them all.
 
 ## Lints
 
-61 lints in four groups. [docs/lints.md](docs/lints.md) describes each one
+70 lints in five groups. [docs/lints.md](docs/lints.md) describes each one
 with an example.
 
 | Group | Severity | Lints |
 |-------|----------|-------|
 | correctness | error | `operand-size-mismatch` `ambiguous-operand-size` `invalid-operands` `invalid-address` `immediate-out-of-range` `jump-to-data` `unknown-instruction` `undefined-symbol` `duplicate-label` `unbalanced-stack` `ret-in-start` |
-| suspicious | warning | `misaligned-call` `mismatched-pop` `odd-stack-adjustment` `variadic-call-without-al` `main-return-value` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` `div-without-rdx` `idiv-zero-extended` `uninitialized-register` `clobbered-register` `partial-register-read` `unknown-syscall` `exit-code-truncated` `pointer-from-contents` `buffer-overflow` `missing-nul-terminator` `infinite-loop` `truncated-address` `data-size-mismatch` `write-to-readonly` `shift-out-of-range` `code-in-data-section` `data-in-bss` `unknown-section` `misplaced-length` `callee-saved-clobbered` `dead-store` `undefined-flags` `constant-comparison` `flags-clobbered` `unused-comparison` |
+| suspicious | warning | `misaligned-call` `mismatched-pop` `odd-stack-adjustment` `variadic-call-without-al` `main-return-value` `fallthrough` `unreachable-code` `int80-in-64bit` `entry-not-global` `div-without-rdx` `idiv-zero-extended` `uninitialized-register` `clobbered-register` `partial-register-read` `unknown-syscall` `exit-code-truncated` `pointer-from-contents` `buffer-overflow` `missing-nul-terminator` `infinite-loop` `truncated-address` `data-size-mismatch` `write-to-readonly` `shift-out-of-range` `code-in-data-section` `data-in-bss` `unknown-section` `misplaced-length` `callee-saved-clobbered` `dead-store` `undefined-flags` `constant-comparison` `flags-clobbered` `unused-comparison` `constant-condition` |
 | style | hint | `unused-label` `unused-extern` `redundant-jump` `jump-over-jump` `jump-to-jump` `mov-zero` `cmp-zero` `self-move` `noop-arithmetic` `lea-as-mov` `redundant-test` `redundant-push-pop` `redundant-move` |
+| performance | hint | `redundant-load` `div-by-power-of-two` `mul-by-power-of-two` `fold-constants` `use-lea` `redundant-memory-load` `mergeable-stores` `jump-to-ret` |
 | pedantic | hint, opt-in | `needless-rex` `slow-loop` `absolute-address` |
 
 ### Silencing a lint
@@ -105,6 +106,27 @@ with an example.
 
 A comment on its own line applies to the next statement. `allow(all)`
 silences everything on that line.
+
+### Understanding what the code does
+
+The `performance` lints reason about the program rather than match
+patterns. The analysis follows what every register holds (a constant, the
+address of a label), what each comparison compares and which flags a later
+instruction still reads, through branches, loops, `syscall` (which keeps
+everything but `rax`, `rcx` and `r11`) and calls to the file's own
+functions. From that it finds:
+
+- a load repeated inside a loop that changes nothing (`redundant-load`);
+- a jump whose outcome is already decided (`constant-condition`);
+- `div` by a power of two, with `rdx` known to be zero, that a shift and a
+  mask replace (`div-by-power-of-two`);
+- two adjustments of a register that fold into one, `mov` then `add` that
+  one `lea` does, a second load of memory nothing could have changed;
+- four `mov byte` stores of `H`, `4`, `C`, `K` that one
+  `mov dword [buffer], 'H4CK'` does.
+
+None is suggested when a later instruction reads a flag the replacement
+would set differently.
 
 ### Fixes
 

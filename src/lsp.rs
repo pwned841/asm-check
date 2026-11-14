@@ -43,6 +43,8 @@ const DOCS: &str = "https://github.com/pwned841/asm-check/blob/main/docs/lints.m
 /// Lints about code that can simply be deleted. Editors fade such code out.
 const UNNECESSARY: &[&str] = &[
     "dead-store",
+    "redundant-load",
+    "redundant-memory-load",
     "unreachable-code",
     "unused-label",
     "unused-comparison",

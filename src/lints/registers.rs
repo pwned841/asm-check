@@ -120,7 +120,11 @@ fn dead_stores(cx: &Context, out: &mut Vec<Diagnostic>) {
             if fx.flow == Flow::Syscall {
                 pending[RegId::RAX.index()] = None;
             }
+            // `mov rax, rax` is `self-move`'s business, not a value that goes unused.
+            let copies_itself = insn.ins.mnemonic == "mov"
+                && insn.ins.operands.get(1).and_then(|source| source.as_reg()) == fx.dest;
             if fx.pure
+                && !copies_itself
                 && let Some(dest) = fx.dest
             {
                 pending[dest.id.index()] = Some((index, dest));

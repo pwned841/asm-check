@@ -30,7 +30,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, Edit, Severity};
-use crate::fix::{self, DiffLine};
+use crate::fix;
 use crate::ide::{CompletionKind, Document, SymbolClass};
 use crate::span::Span;
 use crate::{Config, check};
@@ -43,6 +43,8 @@ const DOCS: &str = "https://github.com/pwned841/asm-check/blob/main/docs/lints.m
 /// Lints about code that can simply be deleted. Editors fade such code out.
 const UNNECESSARY: &[&str] = &[
     "dead-store",
+    "redundant-load",
+    "redundant-memory-load",
     "unreachable-code",
     "unused-label",
     "unused-comparison",
@@ -381,32 +383,15 @@ fn range(lines: &[&str], span: Span) -> Range {
 
 fn to_lsp(uri: &Uri, lines: &[&str], diagnostic: &Diagnostic) -> lsp_types::Diagnostic {
     let name = diagnostic.lint.name;
-    // Editors show one message per diagnostic: keep it to the headline and
-    // the fix, as a diff, which Markdown-aware editors colour.
+    // The editor shows plain text: the headline, then the fix on one line.
     let mut message = diagnostic.message.clone();
     match (&diagnostic.fix, &diagnostic.help) {
         (Some(fix), _) => {
-            let rows = fix::preview(fix, lines);
-            let texts = rows.iter().map(|row| match row {
-                DiffLine::Context { text, .. }
-                | DiffLine::Removed { text, .. }
-                | DiffLine::Added { text, .. } => text.as_str(),
-            });
-            let margin = texts
-                .filter(|text| !text.trim().is_empty())
-                .map(|text| text.len() - text.trim_start().len())
-                .min()
-                .unwrap_or(0);
-            message.push_str("\n```diff\n");
-            for row in &rows {
-                let (sign, text) = match row {
-                    DiffLine::Context { text, .. } => (' ', text),
-                    DiffLine::Removed { text, .. } => ('-', text),
-                    DiffLine::Added { text, .. } => ('+', text),
-                };
-                message.push_str(&format!("{sign} {}\n", text.get(margin..).unwrap_or(text)));
+            let summary = fix::summary(fix, lines);
+            if !summary.is_empty() {
+                message.push('\n');
+                message.push_str(&summary);
             }
-            message.push_str("```");
         }
         (None, Some(help)) => message.push_str(&format!("\nhelp: {help}")),
         (None, None) => {}
@@ -570,7 +555,7 @@ mod tests {
         assert_eq!(lsp.range, Range::new(Position::new(1, 4), Position::new(1, 14)));
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(lsp.code, Some(NumberOrString::String("dead-store".into())));
-        assert!(lsp.message.contains("```diff\n- mov rax, 1\n```"), "{}", lsp.message);
+        assert_eq!(lsp.message.lines().last(), Some("fix: remove mov rax, 1"));
         assert_eq!(lsp.related_information.unwrap()[0].location.range.start.line, 2);
         assert_eq!(lsp.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
         assert!(lsp.code_description.unwrap().href.as_str().ends_with("#dead-store"));

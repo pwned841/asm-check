@@ -7,6 +7,7 @@ Every lint belongs to a group, which sets its severity:
 | `correctness` | error | The assembler rejects it, or it is wrong on every run. |
 | `suspicious` | warning | Almost certainly a bug. |
 | `style` | hint | Works, but has a shorter or clearer form. |
+| `performance` | hint | Works, but a faster or smaller form exists. |
 | `pedantic` | hint | Stricter suggestions, only with `--pedantic`. |
 
 Silence a lint on one line with `; asm-check: allow(name)`, for a whole
@@ -367,6 +368,26 @@ Only reported for a single straight-line loop whose test is a `cmp` or
 `test`. With a memory operand, any store in the loop counts as a possible
 update.
 
+### constant-condition
+
+A conditional jump whose outcome is already decided: at that point both
+sides of the comparison hold known constants.
+
+```nasm
+mov eax, 5
+cmp eax, 5
+jne .error          ; never taken: eax is 5
+```
+
+A register is known when every path to the jump sets it by loading a
+constant, zeroing it, or doing arithmetic on known values. Loops are
+handled: a counter that changes on each iteration is not constant. The
+analysis is skipped in files that use macros or jump through a register,
+and it knows that `syscall` only destroys `rax`, `rcx` and `r11`.
+
+The fixes (`jmp` for a jump always taken, removal for one never taken)
+are not applied by `--fix`: a jump that never fires is often the bug.
+
 ### callee-saved-clobbered
 
 An exported function (`global`, or `main`) changes `rbx`, `rbp` or
@@ -511,13 +532,113 @@ flags afterwards, because `xor` changes them and `mov` does not.
 `add reg, 0`, `shl reg, 0`, `and reg, -1`, `imul reg, 1`: the operand is
 left unchanged and only the flags are affected.
 
+## Performance
+
+These lints work out what the code is doing before saying anything: what
+each register holds, which flags are still read, whether two stores touch
+neighbouring bytes. Each fix keeps the program's behaviour, and none is
+suggested when a later instruction reads a flag the replacement would
+change.
+
+### redundant-load
+
+A register is loaded, inside a loop, with the value it already holds on
+every path:
+
+```nasm
+    mov edi, 1
+.again:
+    mov eax, 1
+    mov edi, 1          ; edi still holds 1: the kernel keeps it across syscall
+    syscall
+    dec r12
+    jnz .again
+```
+
+`syscall` destroys `rax`, `rcx` and `r11` only, and a local function
+destroys what it writes, so the registers in between are followed
+precisely. Outside a loop this is not reported: reloading the arguments
+before each system call costs one instruction once, and many programs do
+it for readability.
+
+### div-by-power-of-two
+
+`div` by a register that holds a power of two, with `rdx` known to be zero:
+
+```nasm
+xor edx, edx
+mov rbx, 8
+div rbx             ; quotient: shr rax, 3   remainder: rax & 7
+```
+
+The fix replaces the division with `mov rdx, rax`, `and rdx, 7` and
+`shr rax, 3`, and drops the `xor edx, edx` that prepared it. A division
+takes many cycles; a shift takes one.
+
+### mul-by-power-of-two
+
+`imul rax, 8` is `shl rax, 3`. Not reported when a later instruction reads
+the carry or overflow flag, which `imul` and `shl` set differently.
+
+### fold-constants
+
+Two constant adjustments of a register in a row become one:
+
+```nasm
+sub rdx, 10
+add rdx, 'A'        ; add rdx, 55
+```
+
+`mov rax, 5` followed by `add rax, 3` becomes `mov rax, 8`, and an
+adjustment undone by the next one disappears. The zero, sign and parity
+flags depend only on the final value, so they may be read afterwards; the
+carry and overflow flags may not.
+
+### use-lea
+
+```nasm
+mov rax, r15
+add rax, 4          ; lea rax, [r15 + 4]
+```
+
+`lea` adds without the copy. Not reported when a later instruction reads
+the flags that `add` would have set.
+
+### redundant-memory-load
+
+The same address is read twice and nothing in between can have changed it:
+no store, no call, no system call, and the register holding the value and
+the registers forming the address are untouched. The second load is
+dropped, or becomes a register copy when it targets another register.
+
+### mergeable-stores
+
+```nasm
+mov byte [buffer + r15], 'H'
+mov byte [buffer + r15 + 1], '4'
+mov byte [buffer + r15 + 2], 'C'
+mov byte [buffer + r15 + 3], 'K'    ; mov dword [buffer + r15], 'H4CK'
+```
+
+Consecutive byte stores of constants to adjacent addresses are written by
+one wider store. NASM places the first character of `'H4CK'` at the lowest
+address, which is the order of the four stores.
+
+### jump-to-ret
+
+A `jmp` whose target is a `ret` can return directly. The jump does not
+change the stack, so the `ret` it lands on does exactly what a `ret` in its
+place would do.
+
 ## Pedantic
 
 ### needless-rex
 
 `xor rax, rax` can be `xor eax, eax`: writing a 32-bit register clears the
 upper half, so the result is the same and the REX prefix byte is saved.
-Not reported for `r8`-`r15`, which need the prefix either way.
+The same goes for `movzx rax, byte [rsi]`, which `movzx eax, byte [rsi]`
+does one byte shorter. Not reported for `r8`-`r15`, which need the prefix
+either way.
 
 `mov rax, 1` is not reported: NASM already encodes it as `mov eax, 1`.
 

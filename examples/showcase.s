@@ -181,6 +181,42 @@ duplicate:
 duplicate:                      ; duplicate-label
     ret
 
+; ------------------------------------------------------------- performance
+
+performance:
+    mov edi, 1
+    mov rsi, message
+    mov ebx, 3
+.repeat:
+    mov eax, 1
+    mov edi, 1                  ; redundant-load: rdi never changes inside the loop
+    mov edx, 6
+    syscall
+    dec ebx
+    jnz .repeat
+
+    xor edx, edx
+    mov rbx, 8
+    mov rax, rcx
+    div rbx                     ; div-by-power-of-two: shr rax, 3 and and rdx, 7
+    imul rax, 16                ; mul-by-power-of-two: shl rax, 4
+    add rax, 1                  ; fold-constants: add rax, 3
+    add rax, 2
+    mov rbx, rax                ; use-lea: lea rbx, [rax + rcx]
+    add rbx, rcx
+    mov rax, [value]
+    mov rax, [value]            ; redundant-memory-load: already in rax
+    mov byte [buffer], 'H'      ; mergeable-stores: one 16-bit store
+    mov byte [buffer + 1], 'i'
+    mov eax, 5
+    cmp eax, 5
+    jne .never                  ; constant-condition: eax is always 5
+    jmp .quit                   ; jump-to-ret: return from here
+.never:
+    nop
+.quit:
+    ret
+
 ; ------------------------------------------------------------- entry point
 
 _start:
@@ -202,6 +238,7 @@ _start:
     call swapped
     call main
     call comparisons
+    call performance
 .done:
     ret                         ; ret-in-start: there is no return address
 

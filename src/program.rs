@@ -268,9 +268,9 @@ impl<'a> Program<'a> {
     }
 
     /// Whether an operand is the bare symbol, with no arithmetic on it.
-    fn is_plain(&self, operand: &crate::ast::Operand, name: &str) -> bool {
-        let text = self.snippet(operand.span);
-        text.is_empty() || name.ends_with(text.trim())
+    pub fn is_plain(&self, operand: &crate::ast::Operand, name: &str) -> bool {
+        let text = self.snippet(operand.span).trim();
+        !text.is_empty() && name.ends_with(text)
     }
 
     /// The instruction that last wrote `reg` before the one at `index`,

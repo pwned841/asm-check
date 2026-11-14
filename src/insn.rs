@@ -6,7 +6,7 @@ use crate::mnemonic::condition;
 use crate::reg::{Reg, RegId, RegSet};
 
 /// A set of status flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Flags(u8);
 
 impl Flags {

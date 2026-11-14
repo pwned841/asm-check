@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostic::{Edit, Fix};
+use crate::parser::comment_start;
 
 /// One line of a fix preview. `number` is the 0-based line of the original
 /// file the row belongs to.
@@ -80,7 +81,9 @@ fn rewritten(plan: &LinePlan, original: &str) -> Vec<String> {
 pub fn preview(fix: &Fix, lines: &[&str]) -> Vec<DiffLine> {
     let mut diff = Vec::new();
     for (number, plan) in plan([fix]) {
-        let original = lines.get(number).copied().unwrap_or("");
+        let full = lines.get(number).copied().unwrap_or("");
+        // A comment is noise in a preview: show the code alone.
+        let original = full[..comment_start(full).min(full.len())].trim_end();
         let added = |text: String| DiffLine::Added { number, text };
         diff.extend(plan.before.iter().flat_map(|text| indented(text, original)).map(added));
         if plan.delete || !plan.replaces.is_empty() {
@@ -92,6 +95,47 @@ pub fn preview(fix: &Fix, lines: &[&str]) -> Vec<DiffLine> {
         diff.extend(plan.after.iter().flat_map(|text| indented(text, original)).map(added));
     }
     diff
+}
+
+/// The fix as plain text, for editors that do not render Markdown:
+/// `fix: mov [x], 0  →  mov byte [x], 0`, `fix: remove mov rax, rax`, or a
+/// short list of `-` and `+` lines when several lines change.
+pub fn summary(fix: &Fix, lines: &[&str]) -> String {
+    let rows = preview(fix, lines);
+    let collect = |wanted_removed: bool| -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                DiffLine::Removed { text, .. } if wanted_removed => Some(text.trim().to_string()),
+                DiffLine::Added { text, .. } if !wanted_removed => Some(text.trim().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (removed, added) = (collect(true), collect(false));
+    // The arrow says "this becomes that": only true on a single line.
+    let lines_touched: std::collections::BTreeSet<usize> = rows
+        .iter()
+        .filter_map(|row| match row {
+            DiffLine::Removed { number, .. } | DiffLine::Added { number, .. } => Some(*number),
+            DiffLine::Context { .. } => None,
+        })
+        .collect();
+    match (removed.as_slice(), added.as_slice()) {
+        ([], []) => String::new(),
+        ([old], [new]) if lines_touched.len() == 1 => format!("fix: {old}  →  {new}"),
+        ([old], []) => format!("fix: remove {old}"),
+        ([], [new]) => format!("fix: insert {new}"),
+        _ => {
+            let mut text = String::from("fix:");
+            for line in &removed {
+                text.push_str(&format!("\n  - {line}"));
+            }
+            for line in &added {
+                text.push_str(&format!("\n  + {line}"));
+            }
+            text
+        }
+    }
 }
 
 /// Applies the fixes to `source`. A fix that touches a line an earlier fix
@@ -198,6 +242,21 @@ mod tests {
                 DiffLine::Added { number: 1, text: "    xor eax, eax".into() },
             ]
         );
+    }
+
+    #[test]
+    fn previews_and_summaries_leave_comments_out() {
+        let lines = ["    mov [x], 0 ; clear it", "    mov rax, rax ; no-op", "    div rbx"];
+        let replace =
+            fix(vec![Edit::Replace { span: Span::new(0, 4, 14), text: "mov byte [x], 0".into() }]);
+        assert_eq!(summary(&replace, &lines), "fix: mov [x], 0  →  mov byte [x], 0");
+        assert_eq!(summary(&fix(vec![Edit::DeleteLine(1)]), &lines), "fix: remove mov rax, rax");
+        let insert = fix(vec![Edit::InsertBefore { line: 2, text: "xor edx, edx".into() }]);
+        assert_eq!(summary(&insert, &lines), "fix: insert xor edx, edx");
+        let several =
+            fix(vec![Edit::DeleteLine(1), Edit::InsertAfter { line: 2, text: "nop".into() }]);
+        assert_eq!(summary(&several, &lines), "fix:\n  - mov rax, rax\n  + nop");
+        assert_eq!(summary(&fix(vec![]), &lines), "");
     }
 
     #[test]

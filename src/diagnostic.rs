@@ -36,6 +36,8 @@ pub enum Group {
     Suspicious,
     /// Code that works but can be written in a shorter or clearer way.
     Style,
+    /// Code that works but can be made faster or smaller.
+    Performance,
     /// Stricter suggestions, off unless requested.
     Pedantic,
 }
@@ -46,6 +48,7 @@ impl Group {
             Group::Correctness => "correctness",
             Group::Suspicious => "suspicious",
             Group::Style => "style",
+            Group::Performance => "performance",
             Group::Pedantic => "pedantic",
         }
     }
@@ -54,7 +57,7 @@ impl Group {
         match self {
             Group::Correctness => Severity::Error,
             Group::Suspicious => Severity::Warning,
-            Group::Style | Group::Pedantic => Severity::Hint,
+            Group::Style | Group::Performance | Group::Pedantic => Severity::Hint,
         }
     }
 }

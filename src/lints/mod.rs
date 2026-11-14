@@ -7,6 +7,7 @@ pub mod division;
 pub mod flags;
 pub mod memory;
 pub mod operands;
+pub mod optimize;
 pub mod registers;
 pub mod sections;
 pub mod stack;
@@ -99,6 +100,15 @@ pub static ALL: &[&Lint] = &[
     &flags::UNUSED_COMPARISON,
     &symbols::UNUSED_LABEL,
     &sections::UNUSED_EXTERN,
+    &optimize::CONSTANT_CONDITION,
+    &optimize::REDUNDANT_LOAD,
+    &optimize::DIV_BY_POWER_OF_TWO,
+    &optimize::MUL_BY_POWER_OF_TWO,
+    &optimize::FOLD_CONSTANTS,
+    &optimize::USE_LEA,
+    &optimize::REDUNDANT_MEMORY_LOAD,
+    &optimize::MERGEABLE_STORES,
+    &optimize::JUMP_TO_RET,
     &control::REDUNDANT_JUMP,
     &control::JUMP_OVER_JUMP,
     &control::JUMP_TO_JUMP,
@@ -130,6 +140,7 @@ const PASSES: &[Pass] = &[
     flags::check,
     syscall::check,
     style::check,
+    optimize::check,
 ];
 
 pub fn run(context: &Context) -> Vec<Diagnostic> {

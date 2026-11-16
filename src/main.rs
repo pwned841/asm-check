@@ -167,8 +167,9 @@ fn check(cli: &Cli) -> ExitCode {
         } else {
             source
         };
-        if asm_check::is_gnu_syntax(&source) {
-            eprintln!("asm-check: {name}: skipped, GNU assembler syntax is not supported");
+        let dialect = asm_check::dialect::detect(&source);
+        if dialect != asm_check::dialect::Dialect::Nasm {
+            eprintln!("asm-check: {name}: skipped, {} syntax is not supported", dialect.name());
         }
         let mut diagnostics = asm_check::check(&source, &config);
         diagnostics.retain(|d| d.severity >= level);

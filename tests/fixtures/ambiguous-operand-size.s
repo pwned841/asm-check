@@ -12,7 +12,16 @@ sizes:
     shl [rdi], 1            ;~
     div [rbx]               ;~
     div qword [rbx]
-    push [rdi]
+    push [rdi]              ;~
+    pop [rdi]               ;~
+    push qword [rdi]
+    movzx eax, [rdi]        ;~
+    movzx eax, byte [rdi]
+    movzx ax, [rdi]
+    movsx rax, [rsi]        ;~
+    bt [rdi], 1             ;~
+    bt dword [rdi], 1
+    bt [rdi], rax
     ret
 
 section .data

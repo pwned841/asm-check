@@ -93,6 +93,13 @@ fn address(cx: &Context, insn: &Insn, operand: &Operand, mem: &Mem, out: &mut Ve
         );
         return;
     }
+    if mem.regs.len() == 2 && mem.regs.iter().all(|reg| reg.id == RegId::RSP) {
+        invalid(
+            "`rsp` cannot be both base and index".to_string(),
+            "`rsp` can only be a base register; put the index in another register",
+        );
+        return;
+    }
     // With one register, NASM splits `rax*3` into `rax + rax*2`.
     let allowed: &[i64] = if mem.regs.len() == 1 { &[1, 2, 3, 4, 5, 8, 9] } else { &[1, 2, 4, 8] };
     for (reg, factor) in &mem.scales {
@@ -303,7 +310,8 @@ fn immediate(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
             out.push(diagnostic);
         }
     } else if bits < 64 {
-        let (min, max) = (-(1i64 << (bits - 1)), (1i64 << bits) - 1);
+        // NASM accepts anything from -2^n to 2^n - 1 for an n-bit operand.
+        let (min, max) = (-(1i64 << bits), (1i64 << bits) - 1);
         if value < min || value > max {
             out.push(
                 Diagnostic::new(

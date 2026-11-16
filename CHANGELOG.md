@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+- Checked against NASM 2.16.01 on 17,004 generated instructions
+  (`scripts/nasm-diff.py`): 0 false positives and 0 missed errors. The
+  first run found 3 false positives and 4,688 missed errors, all fixed.
+- New table of the valid operand forms of `bsf`, `popcnt`, `bt`, `xadd`,
+  `cmpxchg`, `imul`, `cmov`, `setcc`, `bswap`, `movzx`, `movsx`, `movsxd`,
+  and of the sizes NASM wants on `push`, `pop`, `call` and `jmp`.
+- `ambiguous-operand-size` also covers `push [mem]`, `pop [mem]`,
+  `movzx eax, [mem]` and `bt [mem], imm`, which NASM rejects.
+- `invalid-address` covers `[rsp + rsp]`.
+- No longer reported, because NASM accepts them: `lea rax, label`,
+  `movsx rax, eax`, and an n-bit immediate down to -2^n.
+- The 21 course exercises behave identically before and after `--fix`,
+  checked by running them in an x86-64 container.
+
 ## 0.4.1
 
 - MASM and ARM assembly are recognised and left alone. A Python

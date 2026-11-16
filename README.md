@@ -78,7 +78,10 @@ The exit code is `0` when nothing above a hint was found, `1` on errors
 (or warnings with `-D`), `2` when a file could not be read.
 
 `examples/showcase.s` triggers every lint, one commented paragraph each:
-open it in your editor to see them all.
+open it in your editor to see them all. `examples/optimize.s` shows the
+optimizations only: four byte stores merged into one, a division by 8
+turned into a shift, two constants folded, a copy and an addition made one
+`lea`.
 
 ## Lints
 

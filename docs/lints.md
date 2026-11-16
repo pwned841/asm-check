@@ -73,7 +73,8 @@ mov rax, [rax + rsp*2]      ; rsp cannot be an index
 ### immediate-out-of-range
 
 An immediate that does not fit its operand. The assembler warns and keeps
-the low bits.
+the low bits. NASM accepts anything from -2^n to 2^n - 1 for an n-bit
+operand, and so does this lint.
 
 ```nasm
 mov al, 300             ; al holds 0-255: this stores 44

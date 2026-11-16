@@ -1,7 +1,7 @@
 //! Operand combinations the assembler rejects or silently mis-assembles.
 
 use super::Context;
-use crate::ast::Operand;
+use crate::ast::{Operand, OperandKind};
 use crate::diagnostic::{Diagnostic, Group, Lint};
 use crate::mnemonic::condition;
 use crate::program::Insn;
@@ -36,9 +36,10 @@ const EXTENDS: &[&str] = &["movzx", "movsx"];
 fn arity(mnemonic: &str) -> Option<(usize, usize)> {
     Some(match mnemonic {
         "mov" | "movzx" | "movsx" | "movsxd" | "lea" | "add" | "sub" | "adc" | "sbb" | "and"
-        | "or" | "xor" | "cmp" | "test" | "xchg" => (2, 2),
+        | "or" | "xor" | "cmp" | "test" | "xchg" | "bsf" | "bsr" | "popcnt" | "lzcnt" | "tzcnt"
+        | "xadd" | "cmpxchg" | "bt" | "bts" | "btr" | "btc" => (2, 2),
         "inc" | "dec" | "neg" | "not" | "push" | "pop" | "jmp" | "call" | "mul" | "div"
-        | "idiv" => (1, 1),
+        | "idiv" | "bswap" => (1, 1),
         "shl" | "sal" | "shr" | "sar" | "rol" | "ror" | "rcl" | "rcr" => (1, 2),
         "imul" => (1, 3),
         "ret" => (0, 1),
@@ -70,7 +71,7 @@ pub fn check(cx: &Context, out: &mut Vec<Diagnostic>) {
             out.push(Diagnostic::new(&INVALID_OPERANDS, insn.span, message));
             continue;
         }
-        if !invalid(cx, insn, out) {
+        if !invalid(cx, insn, out) && !forms(cx, insn, out) {
             sizes(cx, insn, out);
             ambiguous(cx, insn, out);
         }
@@ -134,9 +135,11 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
         return true;
     }
 
+    // NASM reads `lea rax, label` and `lea rax, 8` as an address: only a
+    // register source is an error.
     if mnemonic == "lea"
         && let Some(source) = second
-        && !source.is_mem()
+        && matches!(source.kind, OperandKind::Reg(_) | OperandKind::OtherReg(_))
     {
         let text = cx.text(source.span);
         out.push(
@@ -168,6 +171,173 @@ fn invalid(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
     false
 }
 
+/// What an operand is, for checking the forms an instruction accepts.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// A general-purpose register of this many bits.
+    Reg(u32),
+    /// Memory, with its size when the source states it.
+    Mem(Option<u32>),
+    Imm,
+    /// A vector, segment or other register this tool does not model.
+    Other,
+}
+
+fn shape(operand: &Operand) -> Shape {
+    match &operand.kind {
+        OperandKind::Reg(reg) => Shape::Reg(reg.width.bits()),
+        OperandKind::Mem(_) => Shape::Mem(operand.size),
+        OperandKind::Imm(_) => Shape::Imm,
+        OperandKind::OtherReg(_) => Shape::Other,
+    }
+}
+
+const WIDE: &str = "needs a 16-, 32- or 64-bit register here";
+const SAME: &str = "needs operands of the same size";
+const NO_IMM: &str = "cannot take an immediate here";
+
+/// The operand an instruction cannot take, and why, for the instructions
+/// whose forms are listed here. `None` when the combination is valid or
+/// not modelled: every entry was checked against NASM 2.16.
+fn form_error(mnemonic: &str, shapes: &[Shape]) -> Option<(usize, &'static str)> {
+    use Shape::{Imm, Mem, Reg};
+    let wide = |shape: Shape| matches!(shape, Reg(16 | 32 | 64));
+    // A register or sized memory whose size disagrees with `bits`.
+    let differs = |shape: Shape, bits: u32| match shape {
+        Reg(other) => other != bits,
+        Mem(Some(other)) => other != bits,
+        _ => false,
+    };
+    match (mnemonic, shapes) {
+        ("bsf" | "bsr" | "popcnt" | "lzcnt" | "tzcnt", [dest, source]) => {
+            if !wide(*dest) {
+                Some((0, "needs a 16-, 32- or 64-bit register as destination"))
+            } else if *source == Imm {
+                Some((1, NO_IMM))
+            } else if let Reg(bits) = dest
+                && differs(*source, *bits)
+            {
+                Some((1, SAME))
+            } else {
+                None
+            }
+        }
+        ("xadd" | "cmpxchg", [dest, source]) => match (dest, source) {
+            (Imm, _) => Some((0, "cannot write to an immediate")),
+            (_, Reg(bits)) if differs(*dest, *bits) => Some((1, SAME)),
+            (_, Reg(_)) => None,
+            _ => Some((1, "needs a register as its second operand")),
+        },
+        ("bt" | "bts" | "btr" | "btc", [dest, source]) => match (dest, source) {
+            (Imm, _) => Some((0, NO_IMM)),
+            (Reg(8), _) | (Mem(Some(8)), _) => Some((0, "needs a 16-, 32- or 64-bit operand")),
+            (_, Mem(_)) | (_, Reg(8)) => Some((1, "needs a register or an immediate bit index")),
+            (_, Reg(bits)) if differs(*dest, *bits) => Some((1, SAME)),
+            _ => None,
+        },
+        ("imul", [dest, source]) => {
+            if !wide(*dest) {
+                Some((0, "needs a 16-, 32- or 64-bit register as destination"))
+            } else if let Reg(bits) = dest
+                && differs(*source, *bits)
+            {
+                Some((1, SAME))
+            } else {
+                None
+            }
+        }
+        ("imul", [dest, source, third]) => {
+            if !wide(*dest) {
+                Some((0, "needs a 16-, 32- or 64-bit register as destination"))
+            } else if *source == Imm {
+                Some((1, "needs a register or memory here"))
+            } else if *third != Imm {
+                Some((2, "needs an immediate as its third operand"))
+            } else if let Reg(bits) = dest
+                && differs(*source, *bits)
+            {
+                Some((1, SAME))
+            } else {
+                None
+            }
+        }
+        ("movzx" | "movsx", [dest, source]) => {
+            if !wide(*dest) {
+                Some((0, "needs a 16-, 32- or 64-bit register as destination"))
+            } else if *source == Imm {
+                Some((1, NO_IMM))
+            } else {
+                None
+            }
+        }
+        ("movsxd", [dest, source]) => {
+            if !matches!(dest, Reg(64)) {
+                Some((0, "needs a 64-bit register as destination"))
+            } else if *source == Imm {
+                Some((1, NO_IMM))
+            } else if differs(*source, 32) {
+                Some((1, "needs a 32-bit source"))
+            } else {
+                None
+            }
+        }
+        ("lea", [dest, _]) if !wide(*dest) => Some((0, WIDE)),
+        ("xchg", [_, Imm]) => Some((1, NO_IMM)),
+        ("mul" | "div" | "idiv" | "imul", [Imm]) => Some((0, NO_IMM)),
+        ("push" | "pop", [Mem(Some(bits))]) if !matches!(bits, 16 | 64) => {
+            Some((0, "has no form of this size in 64-bit mode"))
+        }
+        ("call" | "jmp", [Mem(Some(bits))]) if *bits != 64 => {
+            Some((0, "has no form of this size in 64-bit mode"))
+        }
+        ("bswap", [dest]) if !matches!(dest, Reg(32 | 64)) => {
+            Some((0, "needs a 32- or 64-bit register"))
+        }
+        ("shl" | "sal" | "shr" | "sar" | "rol" | "ror" | "rcl" | "rcr", [_, Mem(_)]) => {
+            Some((1, "needs `cl` or an immediate as the count"))
+        }
+        ("call" | "jmp", [Reg(bits)]) if *bits != 64 => Some((0, "needs a 64-bit register")),
+        (setcc, [dest]) if condition(setcc).is_some_and(|(family, _)| family == "set") => {
+            match dest {
+                Reg(8) | Mem(None | Some(8)) => None,
+                _ => Some((0, "needs an 8-bit register or byte of memory")),
+            }
+        }
+        (cmov, [dest, source]) if condition(cmov).is_some_and(|(family, _)| family == "cmov") => {
+            if !wide(*dest) {
+                Some((0, "needs a 16-, 32- or 64-bit register as destination"))
+            } else if *source == Imm {
+                Some((1, NO_IMM))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Reports a combination of operand kinds the instruction does not have.
+/// Returns `true` when it did.
+fn forms(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) -> bool {
+    let operands = &insn.ins.operands;
+    let shapes: Vec<Shape> = operands.iter().map(shape).collect();
+    if shapes.contains(&Shape::Other) {
+        return false;
+    }
+    let mnemonic = insn.ins.mnemonic.as_str();
+    let Some((at, reason)) = form_error(mnemonic, &shapes) else { return false };
+    let span = operands.get(at).map_or(insn.span, |operand| operand.span);
+    out.push(
+        Diagnostic::new(
+            &INVALID_OPERANDS,
+            span,
+            format!("`{mnemonic}` {reason}: `{}`", cx.text(span)),
+        )
+        .label("no such form of the instruction"),
+    );
+    true
+}
+
 fn sizes(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
     let mnemonic = insn.ins.mnemonic.as_str();
     let (Some(a), Some(b)) = (insn.ins.operands.first(), insn.ins.operands.get(1)) else { return };
@@ -197,7 +367,9 @@ fn sizes(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
     }
 
     // `movzx`/`movsx` only take an 8- or 16-bit source.
-    if EXTENDS.contains(&mnemonic) && (y >= x || y > 16) {
+    // NASM accepts `movsx rax, eax` as `movsxd rax, eax`.
+    let movsxd = mnemonic == "movsx" && x == 64 && y == 32;
+    if EXTENDS.contains(&mnemonic) && !movsxd && (y >= x || y > 16) {
         let mut diagnostic = Diagnostic::new(
             &OPERAND_SIZE_MISMATCH,
             insn.span,
@@ -243,18 +415,27 @@ fn sizes(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
 fn ambiguous(cx: &Context, insn: &Insn, out: &mut Vec<Diagnostic>) {
     let mnemonic = insn.ins.mnemonic.as_str();
     let operands = &insn.ins.operands;
-    let Some(target) = operands.first().filter(|op| op.is_mem() && op.size.is_none()) else {
-        return;
+    let unsized_at = |index: usize| {
+        operands.get(index).filter(|operand| operand.is_mem() && operand.size.is_none())
     };
     let immediate_source =
         operands.get(1).is_some_and(|source| source.is_imm() && source.size.is_none());
-    let undetermined = (BINARY.contains(&mnemonic) && immediate_source)
-        || SHIFTS.contains(&mnemonic)
-        || UNARY.contains(&mnemonic)
-        || (matches!(mnemonic, "mul" | "div" | "idiv" | "imul") && operands.len() == 1);
-    if !undetermined {
-        return;
-    }
+    // `movzx eax, [rdi]`: the memory operand is the source, and nothing says
+    // whether to read a byte or a word.
+    let target = if EXTENDS.contains(&mnemonic) {
+        // Into a 16-bit register the source can only be a byte.
+        unsized_at(1).filter(|_| operands[0].as_reg().is_none_or(|dest| dest.width.bits() > 16))
+    } else {
+        unsized_at(0).filter(|_| {
+            (BINARY.contains(&mnemonic) && immediate_source)
+                || (matches!(mnemonic, "bt" | "bts" | "btr" | "btc") && immediate_source)
+                || SHIFTS.contains(&mnemonic)
+                || UNARY.contains(&mnemonic)
+                || (matches!(mnemonic, "mul" | "div" | "idiv" | "imul") && operands.len() == 1)
+                || (matches!(mnemonic, "push" | "pop") && operands.len() == 1)
+        })
+    };
+    let Some(target) = target else { return };
     let text = cx.text(target.span);
     let diagnostic = Diagnostic::new(
         &AMBIGUOUS_OPERAND_SIZE,

@@ -3,7 +3,8 @@ f:
     mov al, 300                 ;~
     mov al, 255
     mov al, -128
-    mov al, -129                ;~
+    mov al, -129
+    mov al, -257                ;~
     cmp bl, 256                 ;~
     mov byte [rdi], 1000        ;~
     mov ax, 70000               ;~

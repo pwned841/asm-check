@@ -11,5 +11,7 @@ f:
     mov rax, [rax*3]
     mov rax, [rsp + 8]
     lea rax, [rax + rax*4]
+    mov rax, [rsp + rsp]        ;~
+    mov rax, [rax + rsp]
     mov eax, [ebx + ecx*4]
     ret

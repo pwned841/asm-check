@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- MASM and ARM assembly are recognised and left alone. A Python
+  virtualenv held one of each with an `.asm` extension, and both got over a
+  hundred false errors. Checks, hover, outline and completion stay silent on
+  them, as they already did on GNU assembler syntax.
+
 ## 0.4.0
 
 - Editor popups are plain text: the headline, then the fix on one line

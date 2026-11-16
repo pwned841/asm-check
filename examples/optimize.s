@@ -1,8 +1,8 @@
-; What asm-check can improve once it understands what the code does.
+; What asm-check can improve
 global process
 
 section .text
-; rdi = text length, rsi = digit, r15 = write offset
+; rdi = length, rsi = digit, r15 = offset
 process:
     ; four byte stores that spell a word
     mov byte [buffer + r15], 'H'

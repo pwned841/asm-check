@@ -107,6 +107,17 @@ fn gnu_syntax_is_left_alone() {
 }
 
 #[test]
+fn other_assemblers_are_left_alone() {
+    let masm = "slp_save PROTO\npushxmm MACRO reg\n    sub rsp, 16\nENDM\nmain PROC\n    mov rax, rbx\nmain ENDP\nEND\n";
+    let arm = "  AREA sw, CODE, READONLY;\nsw\n    stp x19, x20, [sp, #-16]!\n    bl other\n";
+    for source in [masm, arm] {
+        assert!(check(source, &Config { pedantic: true, ..Config::default() }).is_empty());
+        let document = asm_check::ide::Document::new(source);
+        assert!(document.outline().is_empty() && document.hover(1, 2).is_none());
+    }
+}
+
+#[test]
 fn other_modes_are_left_alone() {
     let source = "bits 32\n_start:\n    push eax\n    int 0x80\n";
     assert!(check(source, &Config::default()).is_empty());

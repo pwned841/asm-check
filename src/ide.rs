@@ -17,6 +17,8 @@ use crate::{abi, docs, reg, syscalls};
 pub struct Document {
     text: Vec<String>,
     lines: Vec<Line>,
+    /// Not NASM: the parse would be meaningless, so nothing is offered.
+    foreign: bool,
 }
 
 /// What a name in the outline is.
@@ -52,7 +54,11 @@ pub struct Completion {
 
 impl Document {
     pub fn new(source: &str) -> Self {
-        Self { text: source.lines().map(str::to_string).collect(), lines: parser::parse(source) }
+        Self {
+            text: source.lines().map(str::to_string).collect(),
+            lines: parser::parse(source),
+            foreign: crate::dialect::detect(source) != crate::dialect::Dialect::Nasm,
+        }
     }
 
     /// The identifier-like word at a byte column, outside comments.
@@ -133,12 +139,18 @@ impl Document {
     }
 
     pub fn definition(&self, line: usize, column: usize) -> Option<Span> {
+        if self.foreign {
+            return None;
+        }
         let program = Program::build(&self.lines);
         let name = self.symbol_at(&program, line, column)?;
         Some(program.symbols[&name].span)
     }
 
     pub fn references(&self, line: usize, column: usize) -> Vec<Span> {
+        if self.foreign {
+            return Vec::new();
+        }
         let program = Program::build(&self.lines);
         match self.symbol_at(&program, line, column) {
             Some(name) => self.occurrences(&name),
@@ -154,6 +166,9 @@ impl Document {
         column: usize,
         new_name: &str,
     ) -> Option<Vec<(Span, String)>> {
+        if self.foreign {
+            return None;
+        }
         let program = Program::build(&self.lines);
         let name = self.symbol_at(&program, line, column)?;
         let bare = new_name.trim_start_matches('.');
@@ -174,6 +189,9 @@ impl Document {
     }
 
     pub fn outline(&self) -> Vec<Outline> {
+        if self.foreign {
+            return Vec::new();
+        }
         let program = Program::build(&self.lines);
         let functions: Vec<&str> =
             program.functions.iter().map(|function| function.name.as_str()).collect();
@@ -201,6 +219,9 @@ impl Document {
     /// - after a conditional jump, the condition it tests;
     /// - after a byte-sized number, the character it stands for.
     pub fn inlay_hints(&self) -> Vec<(usize, usize, String)> {
+        if self.foreign {
+            return Vec::new();
+        }
         let mut program = Program::build(&self.lines);
         program.text = self.text.iter().map(String::as_str).collect();
         let mut hints = Vec::new();
@@ -242,6 +263,9 @@ impl Document {
     }
 
     pub fn completions(&self, line: usize, column: usize) -> Vec<Completion> {
+        if self.foreign {
+            return Vec::new();
+        }
         let Some(text) = self.text.get(line) else { return Vec::new() };
         let before = &text[..column.min(text.len())];
         if column > comment_start(text) {
@@ -306,6 +330,9 @@ impl Document {
 
     /// Markdown describing what is under the cursor, and the span it covers.
     pub fn hover(&self, line: usize, column: usize) -> Option<(Span, String)> {
+        if self.foreign {
+            return None;
+        }
         let (span, word) = self.word_at(line, column)?;
         let lower = word.to_ascii_lowercase();
         let program = Program::build(&self.lines);

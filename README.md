@@ -285,6 +285,21 @@ when the tool cannot tell, it stays quiet.
   model is not checked, and an invalid one outside the cases listed under
   `invalid-operands` is left for the assembler to report.
 
+## Validation
+
+The error lints claim that the assembler rejects something, so they are
+checked against the assembler itself, NASM 2.16.01 (the version Ubuntu 24.04
+ships):
+
+- `python3 scripts/nasm-diff.py` combines every mnemonic with registers of
+  each size, memory operands with and without a size, immediates and labels,
+  has NASM assemble the 17,004 results and compares them with asm-check line
+  by line: **0 false positives and 0 missed errors**. It needs Docker and the
+  image in `scripts/Dockerfile`, or a local NASM 2.16.
+- The 21 exercises of the course, assembled and run in an x86-64 container
+  with 1,263 combinations of arguments and input, behave identically before
+  and after `--fix` and after `--fix --unsafe-fixes`.
+
 ## Development
 
 ```console

@@ -270,8 +270,9 @@ when the tool cannot tell, it stays quiet.
 
 ## Scope and limits
 
-- **NASM syntax only.** Files in GNU assembler syntax (AT&T operands,
-  `.globl` directives) are detected and skipped.
+- **NASM syntax only.** GNU assembler (AT&T operands, `.globl`
+  directives), MASM (`PROC`, `.code`) and ARM files are detected and
+  skipped.
 - **x86-64 Linux.** The calling-convention lints assume the System V ABI
   and the Linux `syscall` convention. Files that select `bits 16` or
   `bits 32` are skipped.
